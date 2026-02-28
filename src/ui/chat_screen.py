@@ -1068,12 +1068,6 @@ class ChatScreen(QWidget):
         delete_action = menu.addAction("Delete")
         delete_action.triggered.connect(lambda: self._delete_chat(chat_id))
 
-        # Apply red styling to the delete action's menu widget
-        for action in menu.actions():
-            widget = menu.widgetForAction(action)
-            if action == delete_action and widget:
-                widget.setStyleSheet("color: #DC2626;")
-
         menu.exec(self.chat_list.mapToGlobal(position))
 
     def _rename_chat(self, chat_id: int, item: QListWidgetItem):
