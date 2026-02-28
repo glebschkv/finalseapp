@@ -165,6 +165,10 @@ class SeverityClassifier:
     def _check_response_severity(self, response: str) -> str:
         """Check response text for severity indicators."""
         response_lower = response.lower()
+        
+        # Override if explicitly states there are no faults/issues
+        if re.search(r"\bno\s+(?:detected\s+)?(?:fault|issue|error|problem)s?\b", response_lower):
+            return "normal"
 
         # Negation patterns to check before counting critical keywords
         negation_patterns = [
