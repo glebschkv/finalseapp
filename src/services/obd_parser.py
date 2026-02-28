@@ -38,6 +38,8 @@ class OBDMetric:
     description: Optional[str] = None
     normal_range: Optional[str] = None
     timestamp: Optional[str] = None
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
 
 
 @dataclass
@@ -574,7 +576,7 @@ class OBDParser:
                 latest_value = values.iloc[-1] if len(values) > 0 else avg_value
 
                 # Classify status
-                status = self._classify_metric_status(metric_name, latest_value)
+                status = self._classify_metric_status(metric_name, latest_value, df=df)
 
                 # Get normal range string
                 ranges = self.METRIC_RANGES.get(metric_name, {})
@@ -661,11 +663,32 @@ class OBDParser:
                 recommended_action="Have the code diagnosed by a professional mechanic"
             )
 
-    def _classify_metric_status(self, metric_name: str, value: float) -> str:
+    def _classify_metric_status(
+        self, metric_name: str, value: float, df: Optional[pd.DataFrame] = None
+    ) -> str:
         """Classify a metric value as normal, warning, or critical."""
         ranges = self.METRIC_RANGES.get(metric_name)
         if not ranges:
             return "normal"
+
+        # Exception: Ignore zero values when vehicle speed is also zero.
+        if value == 0:
+            if metric_name == "vehicle_speed":
+                return "normal"
+
+            speed = None
+            if df is not None:
+                column_map = self._find_valid_columns(df)
+                if "vehicle_speed" in column_map:
+                    speed_col = column_map["vehicle_speed"]
+                    speed_values = pd.to_numeric(
+                        df[speed_col], errors="coerce"
+                    ).dropna()
+                    if not speed_values.empty:
+                        speed = speed_values.iloc[-1]
+
+            if speed == 0:
+                return "normal"
 
         # Critical range check
         if value < ranges.get("critical_low", float("-inf")) or value > ranges.get("critical_high", float("inf")):
@@ -709,11 +732,21 @@ class OBDParser:
                 col = column_map[metric.name]
                 values = pd.to_numeric(df[col], errors="coerce").dropna()
                 if not values.empty:
+                    min_val = float(round(values.min(), 2))
+                    max_val = float(round(values.max(), 2))
+                    mean_val = float(round(values.mean(), 2))
+
+                    # Update metric dataclass to retain min and max values
+                    metric.min_value = min_val
+                    metric.max_value = max_val
+
                     metric_stats[metric.name] = {
-                        "min": float(round(values.min(), 2)),
-                        "max": float(round(values.max(), 2)),
-                        "mean": float(round(values.mean(), 2)),
-                        "std": float(round(values.std(), 2)) if len(values) > 1 else 0.0
+                        "min": min_val,
+                        "max": max_val,
+                        "mean": mean_val,
+                        "std": (
+                            float(round(values.std(), 2)) if len(values) > 1 else 0.0
+                        ),
                     }
 
         stats["metric_statistics"] = metric_stats
