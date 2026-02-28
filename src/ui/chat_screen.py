@@ -52,14 +52,17 @@ class ThinkingIndicator(QFrame):
         layout.addStretch()
 
         # Style the frame
-        self.setStyleSheet("""
-            QFrame {
+        self.setObjectName("thinkingFrame")
+        self.setStyleSheet(
+            """
+            #thinkingFrame {
                 background-color: #F8FAFC;
                 border: 1px solid #E2E8F0;
                 border-left: 3px solid #6366F1;
                 border-radius: 12px;
             }
-        """)
+        """
+        )
 
     def setup_animation(self):
         """Set up the dot animation timer."""
@@ -218,6 +221,7 @@ class MessageWidget(QFrame):
 
         # Message content bubble
         bubble = QFrame()
+        bubble.setObjectName("chatBubble")
         bubble_layout = QVBoxLayout(bubble)
         bubble_layout.setContentsMargins(14, 14, 14, 14)
         bubble_layout.setSpacing(0)
@@ -225,30 +229,37 @@ class MessageWidget(QFrame):
         # Apply styling based on role and severity
         if role == "assistant":
             style = SeverityStyles.get(severity)
-            bubble.setStyleSheet(f"""
-                QFrame {{
+            bubble.setStyleSheet(
+                f"""
+                #chatBubble {{
                     background-color: {style['background']};
                     border-left: 3px solid {style['border']};
                     border-radius: 12px;
                 }}
-            """)
+            """
+            )
         else:
-            bubble.setStyleSheet("""
-                QFrame {
+            bubble.setStyleSheet(
+                """
+                #chatBubble {
                     background-color: #EEF2FF;
                     border-radius: 12px;
                 }
-            """)
+            """
+            )
 
         # Content text
         content_label = QLabel(content)
         content_label.setWordWrap(True)
         content_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        content_label.setStyleSheet("""
+        content_label.setStyleSheet(
+            """
             color: #0F172A;
             background-color: transparent;
             font-size: 14px;
-        """)
+            border: none;
+        """
+        )
         bubble_layout.addWidget(content_label)
 
         content_layout.addWidget(bubble)
@@ -588,13 +599,16 @@ class ChatScreen(QWidget):
 
         # Steps card
         steps_card = QFrame()
-        steps_card.setStyleSheet("""
-            QFrame {
+        steps_card.setObjectName("stepsCard")
+        steps_card.setStyleSheet(
+            """
+            #stepsCard {
                 background-color: #FFFFFF;
                 border: 1px solid #E2E8F0;
                 border-radius: 20px;
             }
-        """)
+        """
+        )
         steps_card.setFixedWidth(420)
         steps_layout = QVBoxLayout(steps_card)
         steps_layout.setContentsMargins(32, 28, 32, 28)
