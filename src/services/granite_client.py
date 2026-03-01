@@ -1,6 +1,5 @@
 """
-IBM Granite Client - Supports local Ollama and watsonx.ai API.
-Prioritizes local Ollama for running without API keys. Falls back to mock mode.
+IBM Granite Client - Local Ollama inference for OBD InsightBot.
 """
 
 from typing import Optional, List, Dict, Any, Callable
@@ -154,20 +153,6 @@ except ImportError:
     HAS_REQUESTS = False
     logger.warning("requests not installed. pip install requests")
 
-# Try to import IBM watsonx libraries (optional, for cloud deployment)
-try:
-    from ibm_watsonx_ai import APIClient, Credentials
-    from ibm_watsonx_ai.foundation_models import ModelInference
-    HAS_WATSONX = True
-except ImportError:
-    HAS_WATSONX = False
-
-try:
-    from langchain_ibm import ChatWatsonx, WatsonxEmbeddings
-    HAS_LANGCHAIN_IBM = True
-except ImportError:
-    HAS_LANGCHAIN_IBM = False
-
 
 class GraniteClient:
     """
@@ -175,8 +160,7 @@ class GraniteClient:
 
     Supports:
     1. Local Ollama server (recommended - no API key needed)
-    2. IBM watsonx.ai API (cloud deployment)
-    3. Mock mode (fallback for demo)
+    2. Mock mode (fallback for demo)
 
     Features:
     - Response caching for repeated queries
@@ -193,9 +177,6 @@ class GraniteClient:
             enable_cache: Enable response caching (default: True)
         """
         self.settings = get_settings()
-        self._chat_model = None
-        self._embeddings = None
-        self._api_client = None
         self._initialized = False
 
         # Response cache
@@ -214,11 +195,7 @@ class GraniteClient:
         if self._use_ollama:
             logger.info(f"Using Ollama model: {self._ollama_model} at {self._ollama_url}")
         else:
-            logger.info("Ollama not available, checking watsonx.ai...")
-            is_valid, errors = self.settings.validate()
-            if not is_valid:
-                logger.warning(f"watsonx.ai not configured: {errors}")
-                logger.info("Running in demo mode with mock responses")
+            logger.info("Ollama not available. Running in demo mode with mock responses.")
 
     def _check_ollama_available(self) -> bool:
         """Check if the Ollama server is running."""
@@ -254,10 +231,7 @@ class GraniteClient:
     @property
     def is_configured(self) -> bool:
         """Check if the client is properly configured."""
-        if self._use_ollama:
-            return True
-        is_valid, _ = self.settings.validate()
-        return is_valid and HAS_WATSONX
+        return self._use_ollama
 
     @property
     def is_using_ollama(self) -> bool:
@@ -275,37 +249,11 @@ class GraniteClient:
                 logger.info("Granite client initialized with Ollama")
                 return True
             else:
-                logger.warning("Ollama became unavailable, falling back...")
+                logger.warning("Ollama became unavailable. Using mock mode.")
                 self._use_ollama = False
 
-        if not self.is_configured:
-            logger.warning("Granite client not configured. Using mock mode.")
-            return False
-
-        # Initialize watsonx.ai (cloud mode)
-        try:
-            credentials = Credentials(
-                url=self.settings.watsonx_url,
-                api_key=self.settings.watsonx_api_key
-            )
-            self._api_client = APIClient(credentials)
-
-            if HAS_LANGCHAIN_IBM:
-                self._chat_model = ChatWatsonx(
-                    model_id=self.settings.granite_chat_model,
-                    url=self.settings.watsonx_url,
-                    apikey=self.settings.watsonx_api_key,
-                    project_id=self.settings.watsonx_project_id,
-                    params=self.settings.generation_params
-                )
-
-            self._initialized = True
-            logger.info("Granite client initialized with watsonx.ai")
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to initialize watsonx.ai client: {e}")
-            return False
+        logger.warning("Granite client not configured. Using mock mode.")
+        return False
 
     def generate_response(self, prompt: str, context: str = "", system_prompt: str = None, use_cache: bool = True) -> str:
         """
@@ -331,17 +279,6 @@ class GraniteClient:
         # Try Ollama first
         if self._use_ollama:
             response = self._generate_ollama(prompt, context, system_prompt)
-        # Try watsonx.ai
-        elif self.is_configured:
-            if not self._initialized:
-                self.initialize()
-            try:
-                full_prompt = self._build_prompt(prompt, context, system_prompt)
-                if self._chat_model:
-                    result = self._chat_model.invoke(full_prompt)
-                    response = result.content
-            except Exception as e:
-                logger.error(f"watsonx.ai error: {e}")
 
         # Fallback to mock
         if response is None:
@@ -577,19 +514,6 @@ class GraniteClient:
         except Exception as e:
             logger.error(f"Error pulling model: {e}")
             return False
-
-    def _build_prompt(self, user_prompt: str, context: str = "", system_prompt: str = None) -> str:
-        """Build the full prompt with system instructions."""
-        if system_prompt is None:
-            system_prompt = self._get_default_system_prompt()
-
-        parts = [system_prompt]
-        if context:
-            parts.append(f"\n\nCONTEXT:\n{context}")
-        parts.append(f"\n\nUSER QUESTION:\n{user_prompt}")
-        parts.append("\n\nRESPONSE:")
-
-        return "".join(parts)
 
     def _get_default_system_prompt(self) -> str:
         """Get the default system prompt for OBD InsightBot."""

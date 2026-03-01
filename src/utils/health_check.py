@@ -70,7 +70,7 @@ class HealthChecker:
 
     Checks:
     - Database connectivity
-    - AI backend availability (local model or watsonx.ai)
+    - AI backend availability (Ollama local model)
     - Disk space
     - Configuration validity
     - Required dependencies
@@ -193,28 +193,14 @@ class HealthChecker:
             except Exception as e:
                 logger.info(f"Ollama not available: {e}")
 
-            # Check watsonx.ai configuration
-            is_valid, errors = self.settings.validate()
-            if is_valid:
-                return ComponentHealth(
-                    name="ai_backend",
-                    status=HealthStatus.HEALTHY,
-                    message="watsonx.ai is configured",
-                    details={
-                        "backend": "watsonx.ai",
-                        "model": self.settings.granite_chat_model
-                    }
-                )
-
             # Neither available - degraded mode with mock
             return ComponentHealth(
                 name="ai_backend",
                 status=HealthStatus.DEGRADED,
-                message="Running in mock mode (no AI backend)",
+                message="Running in mock mode (Ollama not available)",
                 details={
                     "backend": "mock",
                     "ollama_error": f"Ollama not reachable at {ollama_url}",
-                    "watsonx_errors": errors
                 }
             )
 

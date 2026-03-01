@@ -25,17 +25,6 @@ class Settings:
         default_factory=lambda: os.getenv("OLLAMA_MODEL", "granite3.3:2b")
     )
 
-    # IBM watsonx.ai Configuration (Cloud - Optional fallback)
-    watsonx_url: str = field(
-        default_factory=lambda: os.getenv("WATSONX_URL", "https://us-south.ml.cloud.ibm.com")
-    )
-    watsonx_api_key: str = field(
-        default_factory=lambda: os.getenv("WATSONX_API_KEY", "")
-    )
-    watsonx_project_id: str = field(
-        default_factory=lambda: os.getenv("WATSONX_PROJECT_ID", "")
-    )
-
     # IBM Watson Speech Services
     watson_speech_api_key: str = field(
         default_factory=lambda: os.getenv("WATSON_SPEECH_API_KEY", "")
@@ -47,16 +36,11 @@ class Settings:
         )
     )
 
-    # Model IDs (for watsonx.ai cloud fallback)
-    granite_chat_model: str = "ibm/granite-3-8b-instruct"
-    granite_embedding_model: str = "ibm/granite-embedding-107m-multilingual"
-
     # Generation Parameters
     max_new_tokens: int = 1024
     temperature: float = 0.7
     top_p: float = 0.9
     repetition_penalty: float = 1.1
-    decoding_method: str = "greedy"
 
     # Application Settings
     app_debug: bool = field(
@@ -91,7 +75,6 @@ class Settings:
     def generation_params(self) -> dict:
         """Get generation parameters for Granite model."""
         return {
-            "decoding_method": self.decoding_method,
             "max_new_tokens": self.max_new_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,

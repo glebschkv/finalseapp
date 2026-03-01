@@ -270,20 +270,7 @@ class TestGraniteClient:
         assert "OBD InsightBot" in prompt
         assert "diagnostic" in prompt.lower()
 
-    def test_build_prompt(self):
-        """Test prompt building with context."""
-        with patch.object(GraniteClient, '_check_ollama_available', return_value=False):
-            client = GraniteClient()
 
-        full_prompt = client._build_prompt(
-            "What is my vehicle status?",
-            "Engine RPM: 2500",
-            "You are a helpful assistant."
-        )
-
-        assert "You are a helpful assistant." in full_prompt
-        assert "Engine RPM: 2500" in full_prompt
-        assert "What is my vehicle status?" in full_prompt
 
     def test_get_embeddings_mock(self):
         """Test embeddings returns deterministic mock when no backend available."""
