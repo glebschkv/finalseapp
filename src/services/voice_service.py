@@ -1,343 +1,659 @@
 """
 Voice Service for Speech-to-Text and Text-to-Speech.
+Uses faster-whisper for STT and edge-tts (Microsoft Edge neural voices) for TTS.
 Implements BR6: Speech-to-text Dictation and BR7: Voice Conversation Mode
 """
 
-from typing import Optional, Callable, Generator, Tuple
+from typing import Optional, Callable, Tuple
 import threading
 import time
 import io
+import wave
+import struct
+import queue
+import asyncio
+import tempfile
+import os
+import sys
+
+# ── CUDA DLL search path fix (Windows) ───────────────────────
+# nvidia-cublas-cu12 installs DLLs under site-packages/nvidia/*/bin/
+# which is not on the default DLL search path.  Register these
+# directories so CTranslate2 can find cublas64_12.dll at runtime.
+if sys.platform == "win32":
+    import site as _site
+    for _sp in _site.getsitepackages():
+        _nvidia_dir = os.path.join(_sp, "nvidia")
+        if os.path.isdir(_nvidia_dir):
+            for _pkg in os.listdir(_nvidia_dir):
+                _bin = os.path.join(_nvidia_dir, _pkg, "bin")
+                if os.path.isdir(_bin):
+                    os.add_dll_directory(_bin)
 
 from ..config.settings import get_settings
 from ..config.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-# Try to import IBM Watson Speech libraries
-try:
-    from ibm_watson import SpeechToTextV1, TextToSpeechV1
-    from ibm_cloud_sdk_core.authenticators import IAMAuthenticator
-    HAS_WATSON_SPEECH = True
-except ImportError:
-    HAS_WATSON_SPEECH = False
-    logger.warning("ibm-watson not installed. Voice features disabled.")
-
-# Try to import audio libraries
+# ── Audio capture ──────────────────────────────────────────────
 try:
     import sounddevice as sd
     import numpy as np
     HAS_AUDIO = True
 except ImportError:
     HAS_AUDIO = False
-    logger.warning("sounddevice not installed. Audio features limited.")
+    logger.warning("sounddevice/numpy not installed. Audio features limited.")
+
+# ── Speech-to-Text (faster-whisper) ───────────────────────────
+try:
+    from faster_whisper import WhisperModel
+    HAS_WHISPER = True
+except ImportError:
+    HAS_WHISPER = False
+    logger.warning("faster-whisper not installed. STT disabled.")
+
+# ── Text-to-Speech (edge-tts) ────────────────────────────────
+try:
+    import edge_tts
+    HAS_EDGE_TTS = True
+except ImportError:
+    HAS_EDGE_TTS = False
+    logger.warning("edge-tts not installed. TTS disabled.")
 
 
 class VoiceService:
     """
     Service for voice input/output.
 
+    STT : faster-whisper  (local, offline)
+    TTS : edge-tts         (Microsoft Edge neural voices, online)
+
     Implements:
     - BR6.1: Basic voice dictation
-    - BR6.2: Dictation at caret position
-    - BR6.3: Auto-stop on silence
+    - BR6.3: Auto-stop on silence / continuous capture
     - BR6.4: Microphone permission handling
     - BR7.1: Voice session with spoken reply
     - BR7.2: Natural turn-taking
-    - BR7.3: Wake word activation (optional)
     """
+
+    # ── Audio parameters ──────────────────────────────────────
+    SAMPLE_RATE = 16_000          # 16 kHz – expected by Whisper
+    CHANNELS = 1
+    BLOCK_SIZE = 1024             # frames per sounddevice callback
+    DTYPE = "float32"
+
+    # VAD energy thresholds
+    SPEECH_ENERGY_THRESHOLD = 0.015   # RMS above this → speech
+    SILENCE_DURATION_SEC = 2.0        # seconds of silence after speech → segment end
+
+    # Whisper settings
+    WHISPER_MODEL_SIZE = "base"       # tiny | base | small | medium | large-v3
+    WHISPER_DEVICE = "cuda"           # "cpu" or "cuda"
+    WHISPER_COMPUTE = "float16"       # float16 for GPU, auto/float32 for CPU
+
+    # Edge-TTS settings
+    TTS_VOICE = "en-US-AriaNeural"    # Microsoft neural voice
+    TTS_RATE = "+0%"                  # speech rate adjustment
+    TTS_VOLUME = "+0%"                # volume adjustment
 
     def __init__(self):
         self.settings = get_settings()
-        self._stt = None
-        self._tts = None
-        self._is_recording = False
-        self._is_speaking = False
 
-        # Audio settings
-        self.sample_rate = 16000
-        self.channels = 1
-        self.silence_threshold = self.settings.silence_threshold_seconds
+        self._whisper_model: Optional["WhisperModel"] = None
+
+        self._is_listening = False      # continuous-listen loop active
+        self._is_speaking = False       # TTS playback in progress
+        self._stop_speaking = False     # flag to interrupt TTS
+
+        # Dictation mode state
+        self._is_dictating = False      # dictation-mode loop active
+        self._dictation_thread: Optional[threading.Thread] = None
+        self._dictation_queue: queue.Queue = queue.Queue()
+
+        self._listen_thread: Optional[threading.Thread] = None
+        self._audio_queue: queue.Queue = queue.Queue()
 
         self._initialize_services()
 
+    # ──────────────────────────────────────────────────────────
+    # Initialisation
+    # ──────────────────────────────────────────────────────────
+
     def _initialize_services(self):
-        """Initialize IBM Watson speech services."""
-        if not HAS_WATSON_SPEECH:
-            logger.warning("Watson Speech services not available")
+        """Lazy-load models so the UI stays responsive on startup."""
+        # Models are loaded on first use (see _ensure_whisper)
+        logger.info("VoiceService created (models load on first use)")
+
+    @classmethod
+    def preload_model(cls):
+        """
+        Pre-load the Whisper model before QApplication is created.
+
+        CTranslate2 (faster-whisper's backend) crashes with a native
+        segfault when it initialises after PyQt6's native libraries on
+        Windows.  Call this once in main() before QApplication().
+        """
+        if not HAS_WHISPER:
+            logger.info("faster-whisper not installed – skipping model preload")
             return
 
-        api_key = self.settings.watson_speech_api_key
-        url = self.settings.watson_speech_url
+        # Try configured device/compute first, then fall back to CPU float32
+        attempts = [(cls.WHISPER_DEVICE, cls.WHISPER_COMPUTE)]
+        if cls.WHISPER_DEVICE == "cuda":
+            attempts.append(("cpu", "float32"))
 
-        if not api_key:
-            logger.warning("Watson Speech API key not configured")
+        for device, compute in attempts:
+            try:
+                logger.info(f"Pre-loading Whisper model '{cls.WHISPER_MODEL_SIZE}' "
+                            f"(device={device}, compute={compute}) ...")
+                cls._preloaded_model = WhisperModel(
+                    cls.WHISPER_MODEL_SIZE,
+                    device=device,
+                    compute_type=compute,
+                )
+                logger.info(f"Whisper model pre-loaded successfully on {device}")
+                return
+            except Exception as e:
+                logger.warning(f"Pre-load failed (device={device}, compute={compute}): {e}")
+
+        logger.warning("Could not pre-load Whisper model with any configuration")
+        cls._preloaded_model = None
+
+    # Class-level cache for pre-loaded model
+    _preloaded_model = None
+
+    def _ensure_whisper(self):
+        """Load the Whisper model if not already loaded.
+
+        Tries the configured compute_type first, then falls back to
+        float32 which is universally supported on all CPUs.
+        """
+        if self._whisper_model is not None:
             return
+        if not HAS_WHISPER:
+            raise RuntimeError("faster-whisper is not installed.")
 
-        try:
-            authenticator = IAMAuthenticator(api_key)
+        compute_types = [self.WHISPER_COMPUTE]
+        if self.WHISPER_DEVICE == "cpu" and "float32" not in compute_types:
+            compute_types.append("float32")  # safe fallback
+        elif self.WHISPER_DEVICE == "cuda":
+            # If CUDA fails, fall back to CPU with float32
+            compute_types.append("float32")
 
-            # Speech to Text
-            self._stt = SpeechToTextV1(authenticator=authenticator)
-            self._stt.set_service_url(url)
+        last_error = None
+        device = self.WHISPER_DEVICE
+        for ct in compute_types:
+            try:
+                logger.info(f"Loading Whisper model '{self.WHISPER_MODEL_SIZE}' (device={device}, compute={ct}) …")
+                self._whisper_model = WhisperModel(
+                    self.WHISPER_MODEL_SIZE,
+                    device=device,
+                    compute_type=ct,
+                )
+                logger.info("Whisper model ready")
+                return
+            except Exception as e:
+                logger.warning(f"Whisper device='{device}' compute_type='{ct}' failed: {e}")
+                last_error = e
+                # If CUDA failed, try falling back to CPU
+                if device == "cuda":
+                    device = "cpu"
 
-            # Text to Speech
-            self._tts = TextToSpeechV1(authenticator=authenticator)
-            self._tts.set_service_url(url.replace("speech-to-text", "text-to-speech"))
+        raise RuntimeError(f"Failed to load speech recognition model: {last_error}")
 
-            logger.info("Watson Speech services initialized")
+    # ──────────────────────────────────────────────────────────
+    # Properties
+    # ──────────────────────────────────────────────────────────
 
-        except Exception as e:
-            logger.error(f"Failed to initialize Watson Speech: {e}")
+    @property
+    def stt_available(self) -> bool:
+        return HAS_WHISPER and HAS_AUDIO
+
+    @property
+    def tts_available(self) -> bool:
+        return HAS_EDGE_TTS and HAS_AUDIO
 
     @property
     def is_available(self) -> bool:
-        """Check if voice services are available."""
-        return HAS_WATSON_SPEECH and HAS_AUDIO and self._stt is not None
+        return self.stt_available
 
     @property
     def is_recording(self) -> bool:
-        """Check if currently recording."""
-        return self._is_recording
+        return self._is_listening
+
+    @property
+    def is_dictating(self) -> bool:
+        return self._is_dictating
+
+    @property
+    def is_speaking(self) -> bool:
+        return self._is_speaking
+
+    # ──────────────────────────────────────────────────────────
+    # Microphone permission check (BR6.4)
+    # ──────────────────────────────────────────────────────────
 
     def check_microphone_permission(self) -> Tuple[bool, str]:
-        """
-        Check if microphone is available (BR6.4).
-
-        Returns:
-            Tuple of (has_permission, message)
-        """
         if not HAS_AUDIO:
-            return False, "Audio library not installed. Please install sounddevice."
-
+            return False, "Audio library not installed. Please install sounddevice and numpy."
         try:
-            # Try to query audio devices
             devices = sd.query_devices()
-            input_devices = [d for d in devices if d['max_input_channels'] > 0]
-
+            input_devices = [d for d in devices if d["max_input_channels"] > 0]
             if not input_devices:
                 return False, "No microphone found. Please connect a microphone."
-
-            # Try to open a short stream
-            with sd.InputStream(samplerate=self.sample_rate, channels=1, blocksize=1024):
+            with sd.InputStream(samplerate=self.SAMPLE_RATE, channels=1, blocksize=self.BLOCK_SIZE):
                 pass
-
             return True, "Microphone available"
-
         except sd.PortAudioError as e:
-            return False, f"Microphone access denied. Please enable microphone in system settings. ({str(e)})"
+            return False, f"Microphone access denied: {e}"
         except Exception as e:
-            return False, f"Error accessing microphone: {str(e)}"
+            return False, f"Error accessing microphone: {e}"
 
-    def start_dictation(self, callback: Callable[[str], None]) -> bool:
+    # ──────────────────────────────────────────────────────────
+    # Continuous Listening  (STT – faster-whisper)
+    # ──────────────────────────────────────────────────────────
+
+    def start_listening(self, on_transcript: Callable[[str], None]) -> bool:
         """
-        Start speech-to-text dictation (BR6.1).
+        Begin continuous microphone listening.
+
+        The listener captures complete speech segments (using energy-based
+        VAD) and transcribes each one via faster-whisper.  After a segment
+        is transcribed, listening continues automatically so the user can
+        dictate follow-up utterances hands-free.
 
         Args:
-            callback: Function to call with transcribed text
+            on_transcript: called on the **background thread** with
+                           each transcribed string.
 
         Returns:
-            True if started successfully
+            True if listening started successfully.
         """
-        # Check permissions first
-        has_permission, message = self.check_microphone_permission()
-        if not has_permission:
-            callback(f"[Error: {message}]")
+        ok, msg = self.check_microphone_permission()
+        if not ok:
+            logger.error(f"Cannot start listening: {msg}")
             return False
 
-        if not self.is_available:
-            callback("[Voice services not available. Using demo mode.]")
+        if not HAS_WHISPER:
+            logger.error("faster-whisper not installed – STT unavailable")
             return False
 
-        if self._is_recording:
+        if self._is_listening:
             return False
 
-        self._is_recording = True
+        # Ensure model is available (uses pre-loaded model)
+        try:
+            self._ensure_whisper()
+        except RuntimeError as e:
+            logger.error(f"Cannot start listening: {e}")
+            return False
 
-        # Start recording in background thread
-        thread = threading.Thread(
-            target=self._record_and_transcribe,
-            args=(callback,),
-            daemon=True
+        self._is_listening = True
+        self._listen_thread = threading.Thread(
+            target=self._listen_loop,
+            args=(on_transcript,),
+            daemon=True,
         )
-        thread.start()
-
+        self._listen_thread.start()
+        logger.info("Continuous listening started")
         return True
 
-    def stop_dictation(self):
-        """Stop speech-to-text dictation."""
-        self._is_recording = False
+    def stop_listening(self):
+        """Stop the continuous listening loop."""
+        self._is_listening = False
+        if self._listen_thread and self._listen_thread.is_alive():
+            self._listen_thread.join(timeout=3)
+        self._listen_thread = None
+        logger.info("Continuous listening stopped")
 
-    def _record_and_transcribe(self, callback: Callable[[str], None]):
-        """Record audio and transcribe in real-time."""
+    # ── internal listen loop ──────────────────────────────────
+
+    def _listen_loop(self, on_transcript: Callable[[str], None]):
+        """
+        Core loop: record → detect speech segment → transcribe → repeat.
+        Runs on a daemon thread.
+        """
+        # Model should be loaded already via preload/start_listening;
+        # double-check as a safety net.
+        if self._whisper_model is None:
+            try:
+                self._ensure_whisper()
+            except Exception as e:
+                logger.error(f"Whisper init failed in listen loop: {e}")
+                self._is_listening = False
+                return
+
+        speech_buffer: list = []     # list of np arrays of speech frames
+        in_speech = False
+        silence_blocks = 0
+        silence_blocks_limit = int(
+            self.SILENCE_DURATION_SEC * self.SAMPLE_RATE / self.BLOCK_SIZE
+        )
+
+        def _audio_cb(indata, frames, time_info, status):
+            """sounddevice callback – push raw audio blocks."""
+            if status:
+                logger.debug(f"Audio status: {status}")
+            self._audio_queue.put(indata.copy())
+
         try:
-            audio_buffer = []
-            silence_count = 0
-            silence_limit = int(self.silence_threshold * (self.sample_rate / 1024))
-
-            def audio_callback(indata, frames, time_info, status):
-                if status:
-                    logger.warning(f"Audio status: {status}")
-                audio_buffer.extend(indata.copy())
-
-                # Check for silence (BR6.3)
-                volume = np.abs(indata).mean()
-                nonlocal silence_count
-                if volume < 0.01:
-                    silence_count += 1
-                else:
-                    silence_count = 0
-
             with sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=self.channels,
-                dtype=np.float32,
-                blocksize=1024,
-                callback=audio_callback
+                samplerate=self.SAMPLE_RATE,
+                channels=self.CHANNELS,
+                dtype=self.DTYPE,
+                blocksize=self.BLOCK_SIZE,
+                callback=_audio_cb,
             ):
-                while self._is_recording:
-                    time.sleep(0.1)
+                while self._is_listening:
+                    try:
+                        block = self._audio_queue.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
 
-                    # Auto-stop on silence (BR6.3)
-                    if silence_count > silence_limit:
-                        logger.info("Auto-stopping dictation due to silence")
-                        self._is_recording = False
-                        break
+                    rms = float(np.sqrt(np.mean(block ** 2)))
 
-            # Transcribe collected audio
-            if audio_buffer:
-                audio_data = np.array(audio_buffer, dtype=np.float32)
-                transcript = self._transcribe_audio(audio_data)
-                if transcript:
-                    callback(transcript)
+                    if rms >= self.SPEECH_ENERGY_THRESHOLD:
+                        # Speech detected
+                        if not in_speech:
+                            in_speech = True
+                            logger.debug("Speech start detected")
+                        speech_buffer.append(block)
+                        silence_blocks = 0
+                    else:
+                        if in_speech:
+                            silence_blocks += 1
+                            speech_buffer.append(block)  # keep trailing silence
+
+                            if silence_blocks >= silence_blocks_limit:
+                                # End of speech segment
+                                logger.debug("Speech end detected – transcribing")
+                                audio_segment = np.concatenate(speech_buffer, axis=0).flatten()
+                                speech_buffer.clear()
+                                in_speech = False
+                                silence_blocks = 0
+
+                                text = self._transcribe(audio_segment)
+                                if text:
+                                    on_transcript(text)
 
         except Exception as e:
-            logger.error(f"Recording error: {e}")
-            callback(f"[Recording error: {str(e)}]")
+            logger.error(f"Listen loop error: {e}")
         finally:
-            self._is_recording = False
+            self._is_listening = False
+            # Drain queue
+            while not self._audio_queue.empty():
+                try:
+                    self._audio_queue.get_nowait()
+                except queue.Empty:
+                    break
 
-    def _transcribe_audio(self, audio_data: np.ndarray) -> str:
-        """Transcribe audio data using IBM Watson STT."""
-        if not self._stt:
+    # ── transcription ─────────────────────────────────────────
+
+    def _transcribe(self, audio: "np.ndarray") -> str:
+        """
+        Transcribe a numpy float32 audio array using faster-whisper.
+        Returns the concatenated text or empty string.
+        """
+        if self._whisper_model is None:
             return ""
-
         try:
-            # Convert to 16-bit PCM
-            audio_int16 = (audio_data * 32767).astype(np.int16)
-            audio_bytes = audio_int16.tobytes()
-
-            # Call Watson STT
-            response = self._stt.recognize(
-                audio=io.BytesIO(audio_bytes),
-                content_type=f'audio/l16; rate={self.sample_rate}',
-                model='en-US_BroadbandModel'
-            ).get_result()
-
-            # Extract transcript
-            if response['results']:
-                transcript = ' '.join([
-                    result['alternatives'][0]['transcript']
-                    for result in response['results']
-                ])
-                return transcript.strip()
-
-            return ""
-
+            segments, _info = self._whisper_model.transcribe(
+                audio,
+                beam_size=5,
+                language="en",
+                vad_filter=True,
+            )
+            parts = [seg.text for seg in segments]
+            transcript = " ".join(parts).strip()
+            logger.info(f"Transcribed: {transcript[:80]}")
+            return transcript
         except Exception as e:
             logger.error(f"Transcription error: {e}")
             return ""
 
+    # ──────────────────────────────────────────────────────────
+    # Text-to-Speech  (edge-tts)
+    # ──────────────────────────────────────────────────────────
+
     def speak(self, text: str, callback: Optional[Callable[[], None]] = None):
         """
-        Convert text to speech and play (BR7.1).
+        Synthesise *text* to speech with edge-tts and play through speakers.
 
         Args:
-            text: Text to speak
-            callback: Optional callback when finished
+            text:     The text to speak.
+            callback: Optional – called when playback finishes.
         """
-        if not self.is_available:
+        if not self.tts_available:
             logger.warning("TTS not available")
             if callback:
                 callback()
             return
-
         if self._is_speaking:
             return
 
         self._is_speaking = True
+        self._stop_speaking = False
 
-        # Speak in background thread
         thread = threading.Thread(
             target=self._speak_text,
             args=(text, callback),
-            daemon=True
+            daemon=True,
         )
         thread.start()
 
     def _speak_text(self, text: str, callback: Optional[Callable[[], None]] = None):
-        """Synthesize and play speech."""
+        """Synthesise and play speech on a background thread using edge-tts."""
+        tmp_path = None
         try:
-            if not self._tts:
+            # edge-tts is async, so we need our own event loop on this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            # Write synthesised audio to a temp file
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+            os.close(tmp_fd)
+
+            communicate = edge_tts.Communicate(
+                text,
+                voice=self.TTS_VOICE,
+                rate=self.TTS_RATE,
+                volume=self.TTS_VOLUME,
+            )
+            loop.run_until_complete(communicate.save(tmp_path))
+            loop.close()
+
+            if self._stop_speaking:
                 return
 
-            # Synthesize audio
-            response = self._tts.synthesize(
-                text,
-                voice='en-US_MichaelV3Voice',
-                accept='audio/wav'
-            ).get_result()
+            # Read the mp3 and decode to raw audio for sounddevice
+            import soundfile as sf
+            audio_data, sample_rate = sf.read(tmp_path, dtype="float32")
 
-            # Play audio
-            audio_bytes = response.content
-            # Parse WAV and play using sounddevice
-            # (simplified - would need proper WAV parsing)
+            if self._stop_speaking:
+                return
 
-            logger.info(f"TTS completed for: {text[:50]}...")
+            sd.play(audio_data, samplerate=sample_rate)
+            sd.wait()
+
+            logger.info(f"TTS completed for: {text[:60]}…")
 
         except Exception as e:
             logger.error(f"TTS error: {e}")
         finally:
             self._is_speaking = False
+            self._stop_speaking = False
+            # Clean up temp file
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
             if callback:
                 callback()
 
     def stop_speaking(self):
-        """Stop text-to-speech playback."""
-        self._is_speaking = False
+        """Interrupt TTS playback."""
+        self._stop_speaking = True
+        try:
+            sd.stop()
+        except Exception:
+            pass
 
-    def start_voice_mode(
-        self,
-        on_user_speech: Callable[[str], None],
-        on_response: Callable[[str], None]
-    ) -> bool:
+    # ──────────────────────────────────────────────────────────
+    # Legacy convenience aliases
+    # ──────────────────────────────────────────────────────────
+
+    # ──────────────────────────────────────────────────────────
+    # Dictation Mode  (STT → text box, no auto-send)
+    # ──────────────────────────────────────────────────────────
+
+    def start_dictation_mode(self, on_transcript: Callable[[str], None]) -> bool:
         """
-        Start voice conversation mode (BR7.1, BR7.2).
+        Start dictation mode: record until manually stopped or 2 s silence,
+        then transcribe and deliver text via *on_transcript* callback.
+
+        Unlike continuous listening (voice-conversation mode), dictation
+        mode captures a **single** speech segment and stops automatically.
+        The transcribed text is intended to be placed into the input box
+        without being sent.
 
         Args:
-            on_user_speech: Callback when user speech is transcribed
-            on_response: Callback to get response for speech
+            on_transcript: called on the **background thread** with the
+                           transcribed string when recording ends.
 
         Returns:
-            True if started successfully
+            True if dictation started successfully.
         """
-        has_permission, message = self.check_microphone_permission()
-        if not has_permission:
-            logger.error(f"Voice mode failed: {message}")
+        ok, msg = self.check_microphone_permission()
+        if not ok:
+            logger.error(f"Cannot start dictation: {msg}")
             return False
 
-        # Voice mode would implement continuous listening with
-        # turn-taking based on silence detection (BR7.2)
-        logger.info("Voice mode started")
+        if not HAS_WHISPER:
+            logger.error("faster-whisper not installed – STT unavailable")
+            return False
+
+        if self._is_dictating or self._is_listening:
+            return False
+
+        try:
+            self._ensure_whisper()
+        except RuntimeError as e:
+            logger.error(f"Cannot start dictation: {e}")
+            return False
+
+        self._is_dictating = True
+        self._dictation_thread = threading.Thread(
+            target=self._dictation_loop,
+            args=(on_transcript,),
+            daemon=True,
+        )
+        self._dictation_thread.start()
+        logger.info("Dictation mode started")
         return True
 
+    def stop_dictation_mode(self):
+        """Manually stop dictation recording."""
+        self._is_dictating = False
+        if self._dictation_thread and self._dictation_thread.is_alive():
+            self._dictation_thread.join(timeout=3)
+        self._dictation_thread = None
+        logger.info("Dictation mode stopped")
+
+    def _dictation_loop(self, on_transcript: Callable[[str], None]):
+        """
+        Record a single speech segment, transcribe it, then stop.
+
+        Auto-stops after SILENCE_DURATION_SEC of silence following
+        detected speech, **or** when stop_dictation_mode() is called.
+        """
+        if self._whisper_model is None:
+            try:
+                self._ensure_whisper()
+            except Exception as e:
+                logger.error(f"Whisper init failed in dictation loop: {e}")
+                self._is_dictating = False
+                return
+
+        speech_buffer: list = []
+        in_speech = False
+        silence_blocks = 0
+        silence_blocks_limit = int(
+            self.SILENCE_DURATION_SEC * self.SAMPLE_RATE / self.BLOCK_SIZE
+        )
+
+        def _audio_cb(indata, frames, time_info, status):
+            if status:
+                logger.debug(f"Audio status: {status}")
+            self._dictation_queue.put(indata.copy())
+
+        try:
+            with sd.InputStream(
+                samplerate=self.SAMPLE_RATE,
+                channels=self.CHANNELS,
+                dtype=self.DTYPE,
+                blocksize=self.BLOCK_SIZE,
+                callback=_audio_cb,
+            ):
+                while self._is_dictating:
+                    try:
+                        block = self._dictation_queue.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+
+                    rms = float(np.sqrt(np.mean(block ** 2)))
+
+                    if rms >= self.SPEECH_ENERGY_THRESHOLD:
+                        if not in_speech:
+                            in_speech = True
+                            logger.debug("Dictation: speech start")
+                        speech_buffer.append(block)
+                        silence_blocks = 0
+                    else:
+                        if in_speech:
+                            silence_blocks += 1
+                            speech_buffer.append(block)
+
+                            if silence_blocks >= silence_blocks_limit:
+                                # 2 s silence after speech → auto-stop
+                                logger.debug("Dictation: auto-stop on silence")
+                                break
+
+                # Transcribe whatever was captured
+                if speech_buffer:
+                    audio_segment = np.concatenate(speech_buffer, axis=0).flatten()
+                    text = self._transcribe(audio_segment)
+                    if text:
+                        on_transcript(text)
+
+        except Exception as e:
+            logger.error(f"Dictation loop error: {e}")
+        finally:
+            self._is_dictating = False
+            while not self._dictation_queue.empty():
+                try:
+                    self._dictation_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+    # ── Legacy convenience aliases ────────────────────────────
+
+    def start_dictation(self, callback: Callable[[str], None]) -> bool:
+        """Alias for start_listening (backward compat)."""
+        return self.start_listening(callback)
+
+    def stop_dictation(self):
+        """Alias for stop_listening (backward compat)."""
+        self.stop_listening()
+
     def stop_voice_mode(self):
-        """Stop voice conversation mode."""
-        self.stop_dictation()
+        """Stop all voice activity."""
+        self.stop_listening()
         self.stop_speaking()
         logger.info("Voice mode stopped")
 
 
-# Singleton instance
+# ── Singleton ───────────────────────────────────────────────
 _voice_service: Optional[VoiceService] = None
 
 

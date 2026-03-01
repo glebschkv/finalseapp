@@ -102,11 +102,6 @@ class Settings:
         """Validate required settings are configured."""
         errors = []
 
-        if not self.watsonx_api_key:
-            errors.append("WATSONX_API_KEY is not configured")
-        if not self.watsonx_project_id:
-            errors.append("WATSONX_PROJECT_ID is not configured")
-
         return len(errors) == 0, errors
 
 

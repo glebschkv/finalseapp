@@ -21,6 +21,7 @@ from ..services.chat_service import ChatService
 from ..services.obd_parser import OBDParser, OBDParseError
 from ..services.granite_client import GraniteClient
 from ..services.rag_pipeline import RAGPipeline
+from ..services.voice_service import get_voice_service
 from ..config.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -171,11 +172,11 @@ class MessageWidget(QFrame):
                 else:
                     dt = None
                 if dt:
-                    time_str = dt.strftime("%-I:%M %p") if hasattr(dt, 'strftime') else ""
+                    time_str = dt.strftime("%#I:%M %p") if hasattr(dt, 'strftime') else ""
             except (ValueError, OSError):
                 pass
         if not time_str:
-            time_str = datetime.now().strftime("%-I:%M %p")
+            time_str = datetime.now().strftime("%#I:%M %p")
 
         time_label = QLabel(time_str)
         time_label.setStyleSheet("""
@@ -328,6 +329,12 @@ class ChatScreen(QWidget):
     """
 
     logout_requested = pyqtSignal()
+    # Signal emitted from background thread with transcribed text
+    _transcript_signal = pyqtSignal(str)
+    # Signal emitted from background thread with dictation text
+    _dictation_signal = pyqtSignal(str)
+    # Signal emitted when TTS finishes playback
+    _tts_finished_signal = pyqtSignal()
 
     def __init__(self, user: User, session_token: str, parent=None):
         super().__init__(parent)
@@ -337,14 +344,25 @@ class ChatScreen(QWidget):
         self.current_context: dict = {}
         self._active_worker: Optional[ChatWorker] = None
 
+        # Voice state
+        self._voice_active = False      # True while mic is live
+        self._voice_mode = False        # True = auto-send + TTS replies
+        self._dictation_active = False  # True while dictation recording
+
         # Initialize services
         self.obd_parser = OBDParser()
         self.granite_client = GraniteClient()
         self.rag_pipeline = RAGPipeline(self.granite_client)
+        self.voice_service = get_voice_service()
 
         self.setup_ui()
         self._setup_shortcuts()
         self.load_chat_history()
+
+        # Connect voice signals (thread-safe bridge)
+        self._transcript_signal.connect(self._on_voice_transcript)
+        self._dictation_signal.connect(self._on_dictation_transcript)
+        self._tts_finished_signal.connect(self._on_tts_finished)
 
     def setup_ui(self):
         """Set up the chat screen UI."""
@@ -524,6 +542,30 @@ class ChatScreen(QWidget):
         self.message_input.installEventFilter(self)
         input_layout.addWidget(self.message_input, stretch=1)
 
+        # Dictation button ✍️  – speech-to-text into input box
+        self.dictation_btn = QPushButton("\u270D")
+        self.dictation_btn.setObjectName("dictationButton")
+        self.dictation_btn.setFixedSize(48, 48)
+        self.dictation_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.dictation_btn.setToolTip("Dictation – speech to text into input box")
+        self.dictation_btn.setCheckable(True)
+        self.dictation_btn.setEnabled(False)
+        self.dictation_btn.setStyleSheet(self._dictation_btn_style(False))
+        self.dictation_btn.clicked.connect(self._toggle_dictation)
+        input_layout.addWidget(self.dictation_btn)
+
+        # Microphone button 🎤 – voice conversation (auto-send + TTS)
+        self.mic_btn = QPushButton("\U0001F3A4")
+        self.mic_btn.setObjectName("micButton")
+        self.mic_btn.setFixedSize(48, 48)
+        self.mic_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mic_btn.setToolTip("Voice conversation – auto-send + spoken reply")
+        self.mic_btn.setCheckable(True)
+        self.mic_btn.setEnabled(False)
+        self.mic_btn.setStyleSheet(self._mic_btn_style(False))
+        self.mic_btn.clicked.connect(self._toggle_voice)
+        input_layout.addWidget(self.mic_btn)
+
         # Send button with arrow icon
         self.send_btn = QPushButton("\u27A4")
         self.send_btn.setObjectName("sendButton")
@@ -536,7 +578,7 @@ class ChatScreen(QWidget):
         layout.addWidget(self.input_frame)
 
         # Keyboard hint
-        hint_label = QLabel("Enter to send  |  Shift+Enter for new line  |  Ctrl+N new chat")
+        hint_label = QLabel("Enter to send  |  Shift+Enter for new line  |  \u270D Dictation  |  \U0001F3A4 Voice  |  Ctrl+N new chat")
         hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint_label.setStyleSheet("""
             color: #CBD5E1;
@@ -851,6 +893,8 @@ class ChatScreen(QWidget):
             self.message_input.setEnabled(True)
             self.message_input.setPlaceholderText("Ask about your vehicle...")
             self.send_btn.setEnabled(True)
+            self.mic_btn.setEnabled(True)
+            self.dictation_btn.setEnabled(True)
 
             # Re-index data for RAG if needed (with error handling)
             try:
@@ -909,6 +953,286 @@ class ChatScreen(QWidget):
             elif event.type() == QEvent.Type.FocusOut:
                 self.input_frame.setStyleSheet(self._input_frame_base_style % "#E2E8F0")
         return super().eventFilter(obj, event)
+
+    # ──────────────────────────────────────────────────────
+    # Voice helpers
+    # ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _mic_btn_style(active: bool) -> str:
+        """Return stylesheet for the mic button."""
+        if active:
+            return """
+                QPushButton {
+                    background-color: #EF4444;
+                    color: #FFFFFF;
+                    border-radius: 24px;
+                    font-size: 20px;
+                    border: 2px solid #DC2626;
+                }
+                QPushButton:hover {
+                    background-color: #DC2626;
+                }
+            """
+        return """
+            QPushButton {
+                background-color: #F1F5F9;
+                color: #64748B;
+                border-radius: 24px;
+                font-size: 20px;
+                border: 1px solid #E2E8F0;
+            }
+            QPushButton:hover {
+                background-color: #E2E8F0;
+                color: #6366F1;
+            }
+            QPushButton:disabled {
+                background-color: #F8FAFC;
+                color: #CBD5E1;
+            }
+        """
+
+    @staticmethod
+    def _dictation_btn_style(active: bool) -> str:
+        """Return stylesheet for the dictation button."""
+        if active:
+            return """
+                QPushButton {
+                    background-color: #F59E0B;
+                    color: #FFFFFF;
+                    border-radius: 24px;
+                    font-size: 20px;
+                    border: 2px solid #D97706;
+                }
+                QPushButton:hover {
+                    background-color: #D97706;
+                }
+            """
+        return """
+            QPushButton {
+                background-color: #F1F5F9;
+                color: #64748B;
+                border-radius: 24px;
+                font-size: 20px;
+                border: 1px solid #E2E8F0;
+            }
+            QPushButton:hover {
+                background-color: #E2E8F0;
+                color: #F59E0B;
+            }
+            QPushButton:disabled {
+                background-color: #F8FAFC;
+                color: #CBD5E1;
+            }
+        """
+
+    def _toggle_voice(self):
+        """Toggle continuous voice listening on/off."""
+        # If dictation is active, stop it first
+        if self._dictation_active:
+            self._stop_dictation()
+        if self._voice_active:
+            self._stop_voice()
+        else:
+            self._start_voice()
+
+    def _start_voice(self):
+        """Start continuous listening through the microphone."""
+        if not self.current_chat:
+            self.mic_btn.setChecked(False)
+            return
+
+        ok, msg = self.voice_service.check_microphone_permission()
+        if not ok:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Microphone", msg)
+            self.mic_btn.setChecked(False)
+            return
+
+        # Show loading state while model loads (can take a while first time)
+        self.mic_btn.setEnabled(False)
+        self.mic_btn.setToolTip("Loading speech model…")
+        self.message_input.setPlaceholderText("Loading speech model, please wait…")
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        # Thread-safe callback: emit Qt signal from background thread
+        def _on_transcript(text: str):
+            self._transcript_signal.emit(text)
+
+        try:
+            started = self.voice_service.start_listening(_on_transcript)
+        except Exception as e:
+            logger.error(f"Failed to start voice: {e}")
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Voice Error",
+                                f"Could not start speech recognition:\n{e}")
+            self.mic_btn.setEnabled(True)
+            self.mic_btn.setChecked(False)
+            self.message_input.setPlaceholderText("Ask about your vehicle...")
+            return
+
+        self.mic_btn.setEnabled(True)
+        if started:
+            self._voice_active = True
+            self._voice_mode = True
+            self.mic_btn.setChecked(True)
+            self.mic_btn.setStyleSheet(self._mic_btn_style(True))
+            self.mic_btn.setToolTip("Listening… click to stop")
+            self.message_input.setPlaceholderText("\U0001F3A4 Listening – speak now…")
+        else:
+            self.mic_btn.setChecked(False)
+            self.message_input.setPlaceholderText("Ask about your vehicle...")
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Voice Error",
+                                "Could not start speech recognition. "
+                                "The speech model may not be compatible with your system.")
+
+    def _stop_voice(self):
+        """Stop continuous listening."""
+        self.voice_service.stop_listening()
+        self._voice_active = False
+        self._voice_mode = False
+        self.mic_btn.setChecked(False)
+        self.mic_btn.setStyleSheet(self._mic_btn_style(False))
+        self.mic_btn.setToolTip("Voice conversation – auto-send + spoken reply")
+        if self.current_chat:
+            self.message_input.setPlaceholderText("Ask about your vehicle...")
+
+    # ──────────────────────────────────────────────────
+    # Dictation helpers
+    # ──────────────────────────────────────────────────
+
+    def _toggle_dictation(self):
+        """Toggle dictation mode on/off."""
+        # If voice conversation is active, stop it first
+        if self._voice_active:
+            self._stop_voice()
+        if self._dictation_active:
+            self._stop_dictation()
+        else:
+            self._start_dictation()
+
+    def _start_dictation(self):
+        """Start dictation mode – record speech and put text in input box."""
+        if not self.current_chat:
+            self.dictation_btn.setChecked(False)
+            return
+
+        ok, msg = self.voice_service.check_microphone_permission()
+        if not ok:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Microphone", msg)
+            self.dictation_btn.setChecked(False)
+            return
+
+        # Show loading state while model loads
+        self.dictation_btn.setEnabled(False)
+        self.dictation_btn.setToolTip("Loading speech model\u2026")
+        self.message_input.setPlaceholderText("Loading speech model, please wait\u2026")
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        def _on_transcript(text: str):
+            self._dictation_signal.emit(text)
+
+        try:
+            started = self.voice_service.start_dictation_mode(_on_transcript)
+        except Exception as e:
+            logger.error(f"Failed to start dictation: {e}")
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Dictation Error",
+                                f"Could not start dictation:\n{e}")
+            self.dictation_btn.setEnabled(True)
+            self.dictation_btn.setChecked(False)
+            self.message_input.setPlaceholderText("Ask about your vehicle...")
+            return
+
+        self.dictation_btn.setEnabled(True)
+        if started:
+            self._dictation_active = True
+            self.dictation_btn.setChecked(True)
+            self.dictation_btn.setStyleSheet(self._dictation_btn_style(True))
+            self.dictation_btn.setToolTip("Recording\u2026 click to stop")
+            self.message_input.setPlaceholderText("\u270D Dictating \u2013 speak now\u2026")
+        else:
+            self.dictation_btn.setChecked(False)
+            self.message_input.setPlaceholderText("Ask about your vehicle...")
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Dictation Error",
+                                "Could not start dictation. "
+                                "The speech model may not be compatible with your system.")
+
+    def _stop_dictation(self):
+        """Stop dictation recording (triggers transcription of captured audio)."""
+        self.voice_service.stop_dictation_mode()
+        self._dictation_active = False
+        self.dictation_btn.setChecked(False)
+        self.dictation_btn.setStyleSheet(self._dictation_btn_style(False))
+        self.dictation_btn.setToolTip("Dictation \u2013 speech to text into input box")
+        if self.current_chat:
+            self.message_input.setPlaceholderText("Ask about your vehicle...")
+
+    def _on_dictation_transcript(self, text: str):
+        """
+        Slot called on the main thread when dictation transcription is ready.
+        Places the text into the input box without sending.
+        """
+        if not text:
+            return
+
+        # Reset dictation button state
+        self._dictation_active = False
+        self.dictation_btn.setChecked(False)
+        self.dictation_btn.setStyleSheet(self._dictation_btn_style(False))
+        self.dictation_btn.setToolTip("Dictation \u2013 speech to text into input box")
+
+        # Append transcribed text to the input box (preserve existing text)
+        existing = self.message_input.toPlainText()
+        if existing and not existing.endswith(" "):
+            existing += " "
+        self.message_input.setPlainText(existing + text)
+        self.message_input.setFocus()
+        # Move cursor to end
+        cursor = self.message_input.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.message_input.setTextCursor(cursor)
+        if self.current_chat:
+            self.message_input.setPlaceholderText("Ask about your vehicle...")
+
+    def _on_voice_transcript(self, text: str):
+        """
+        Slot called on the main thread when a speech segment is transcribed.
+        Automatically sends the text as a user query.
+        """
+        if not text or not self.current_chat:
+            return
+
+        # Pause listening while the AI responds
+        self.voice_service.stop_listening()
+
+        # Put text in the input box and send it
+        self.message_input.setPlainText(text)
+        self._send_message()
+
+    def _on_tts_finished(self):
+        """
+        Called when TTS playback finishes.
+        Resumes listening if voice mode is still enabled.
+        """
+        if self._voice_mode and self.current_chat:
+            def _on_transcript(text: str):
+                self._transcript_signal.emit(text)
+            try:
+                started = self.voice_service.start_listening(_on_transcript)
+            except Exception as e:
+                logger.error(f"Failed to resume listening after TTS: {e}")
+                started = False
+            if started:
+                self._voice_active = True
+                self.mic_btn.setChecked(True)
+                self.mic_btn.setStyleSheet(self._mic_btn_style(True))
+                self.message_input.setPlaceholderText("\U0001F3A4 Listening – speak now…")
 
     def _cleanup_worker(self):
         """Cancel and clean up the active worker thread."""
@@ -1006,6 +1330,15 @@ class ChatScreen(QWidget):
             severity=response["severity"]
         )
         self._add_message_widget(msg.to_dict())
+
+        # If voice mode is active, speak the response via TTS
+        if self._voice_mode and self.voice_service.tts_available:
+            def _tts_done():
+                self._tts_finished_signal.emit()
+            self.voice_service.speak(response["response"], callback=_tts_done)
+        elif self._voice_mode:
+            # TTS not available – resume listening immediately
+            self._on_tts_finished()
 
     def _on_response_error(self, error: str):
         """Handle error from worker."""
@@ -1168,6 +1501,10 @@ class ChatScreen(QWidget):
                 self.message_input.setEnabled(False)
                 self.message_input.setPlaceholderText("Create a new chat to start messaging")
                 self.send_btn.setEnabled(False)
+                self.mic_btn.setEnabled(False)
+                self.dictation_btn.setEnabled(False)
+                self._stop_voice()
+                self._stop_dictation()
 
     def _show_settings_menu(self):
         """Show settings/logout menu."""
@@ -1195,6 +1532,8 @@ class ChatScreen(QWidget):
 
     def _logout(self):
         """Handle logout (BR1.3)."""
+        self._stop_voice()
+        self._stop_dictation()
         self._cleanup_worker()
         from ..services.auth_service import AuthService
         AuthService.logout(self.session_token)
