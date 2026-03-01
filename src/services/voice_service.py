@@ -513,6 +513,89 @@ class VoiceService:
             pass
 
     # ──────────────────────────────────────────────────────────
+    # TTS Health Check
+    # ──────────────────────────────────────────────────────────
+
+    def check_tts(self) -> Tuple[bool, str]:
+        """
+        Run a quick diagnostic to verify the TTS pipeline works end-to-end.
+
+        Checks performed:
+        1. edge-tts library is importable
+        2. Audio output device is available
+        3. edge-tts can synthesise a short test phrase to an MP3 file
+        4. The MP3 file is non-empty and can be decoded for playback
+           (or played via afplay on macOS)
+
+        Returns:
+            (ok, message) – *ok* is True if TTS is fully operational.
+        """
+        # 1. Library availability
+        if not HAS_EDGE_TTS:
+            return False, "edge-tts is not installed. Install it with: pip install edge-tts"
+
+        if not HAS_AUDIO:
+            return False, "sounddevice/numpy not installed. Audio playback unavailable."
+
+        # 2. Output device
+        try:
+            devices = sd.query_devices()
+            output_devices = [d for d in devices if d["max_output_channels"] > 0]
+            if not output_devices:
+                return False, "No audio output device found. Please connect speakers or headphones."
+        except Exception as e:
+            return False, f"Could not query audio devices: {e}"
+
+        # 3. Synthesise a short test phrase
+        tmp_path = None
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+            os.close(tmp_fd)
+
+            communicate = edge_tts.Communicate(
+                "TTS check",
+                voice=self.TTS_VOICE,
+                rate=self.TTS_RATE,
+                volume=self.TTS_VOLUME,
+            )
+            loop.run_until_complete(communicate.save(tmp_path))
+            loop.close()
+
+            file_size = os.path.getsize(tmp_path)
+            if file_size == 0:
+                return False, "edge-tts produced an empty audio file. Check your internet connection."
+
+        except Exception as e:
+            return False, f"edge-tts synthesis failed: {e}"
+
+        # 4. Verify the audio file can be decoded / played
+        try:
+            if sys.platform == "darwin":
+                # macOS: just confirm afplay exists
+                import shutil
+                if not shutil.which("afplay"):
+                    return False, "macOS afplay command not found – cannot play audio."
+            else:
+                import soundfile as sf
+                audio_data, sample_rate = sf.read(tmp_path, dtype="float32")
+                if len(audio_data) == 0:
+                    return False, "Decoded audio is empty – soundfile may lack MP3 codec support."
+        except Exception as e:
+            return False, f"Audio decoding failed: {e}"
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+        logger.info("TTS health check passed")
+        return True, "TTS is working properly."
+
+    # ──────────────────────────────────────────────────────────
     # Legacy convenience aliases
     # ──────────────────────────────────────────────────────────
 
