@@ -15,6 +15,7 @@ import asyncio
 import tempfile
 import os
 import sys
+import atexit
 
 from ..config.settings import get_settings
 from ..config.logging_config import get_logger
@@ -98,6 +99,9 @@ class VoiceService:
 
         self._listen_thread: Optional[threading.Thread] = None
         self._audio_queue: queue.Queue = queue.Queue()
+
+        self._current_play_process: Optional['subprocess.Popen'] = None
+        atexit.register(self.stop_speaking)
 
         self._initialize_services()
 
@@ -449,12 +453,15 @@ class VoiceService:
                 # avoids soundfile/libsndfile MP3 decoding issues
                 import subprocess
                 proc = subprocess.Popen(["afplay", tmp_path])
+                self._current_play_process = proc
                 while proc.poll() is None:
                     if self._stop_speaking:
                         proc.terminate()
                         proc.wait(timeout=2)
+                        self._current_play_process = None
                         return
                     time.sleep(0.1)
+                self._current_play_process = None
             else:
                 # Windows / Linux: decode with soundfile and play via sounddevice
                 import soundfile as sf
@@ -485,8 +492,18 @@ class VoiceService:
     def stop_speaking(self):
         """Interrupt TTS playback."""
         self._stop_speaking = True
+        
+        if getattr(self, "_current_play_process", None) is not None:
+            try:
+                self._current_play_process.terminate()
+                self._current_play_process.wait(timeout=1)
+            except Exception:
+                pass
+            self._current_play_process = None
+
         try:
-            sd.stop()
+            if 'sd' in globals():
+                sd.stop()
         except Exception:
             pass
 
