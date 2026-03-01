@@ -17,23 +17,29 @@ sys.path.insert(0, str(PROJECT_ROOT))
 def main():
     """Main application entry point."""
     # Import after path setup
-    from PyQt6.QtWidgets import QApplication
-    from PyQt6.QtCore import Qt
-
     from src.config.settings import get_settings
     from src.config.logging_config import setup_logging
-    from src.ui.main_window import MainWindow
 
     # Setup logging
     settings = get_settings()
     logger = setup_logging(settings.log_level)
     logger.info("Starting OBD InsightBot")
 
+    # Pre-load the Whisper speech model BEFORE PyQt6's QApplication is
+    # created.  CTranslate2 (used by faster-whisper) crashes with a
+    # native segfault if it initialises after Qt's native libraries are
+    # loaded on Windows.  Loading it first avoids the conflict entirely.
+    from src.services.voice_service import VoiceService
+    VoiceService.preload_model()
+
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import Qt
+    from src.ui.main_window import MainWindow
+
     # Validate configuration
     is_valid, errors = settings.validate()
     if not is_valid:
         logger.warning(f"Configuration warnings: {errors}")
-        logger.info("Running in demo mode - some features may be limited")
 
     # Create application
     app = QApplication(sys.argv)
