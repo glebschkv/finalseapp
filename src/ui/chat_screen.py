@@ -85,6 +85,9 @@ class ThinkingIndicator(QFrame):
 class MessageWidget(QFrame):
     """Widget for displaying a single message with severity styling (BR8)."""
 
+    # Signal to emit when read aloud is requested
+    read_aloud_requested = pyqtSignal(str)
+
     def __init__(self, message: dict, parent=None):
         super().__init__(parent)
         self.message = message
@@ -188,6 +191,36 @@ class MessageWidget(QFrame):
         header_layout.addWidget(time_label)
 
         header_layout.addStretch()
+
+        # Read Aloud button
+        self._read_btn = QPushButton("🔊 Read")
+        self._read_btn.setFixedHeight(22)
+        self._read_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._read_btn.setStyleSheet(
+            """
+            QPushButton {
+                background-color: transparent;
+                color: #94A3B8;
+                border: 1px solid #E2E8F0;
+                border-radius: 6px;
+                padding: 2px 8px;
+                font-size: 11px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #F8FAFC;
+                color: #6366F1;
+                border-color: #CBD5E1;
+            }
+            QPushButton:pressed {
+                background-color: #EEF2FF;
+                color: #4F46E5;
+                border-color: #94A3B8;
+            }
+        """
+        )
+        self._read_btn.clicked.connect(lambda: self.read_aloud_requested.emit(content))
+        header_layout.addWidget(self._read_btn)
 
         # Copy button for assistant messages
         if role == "assistant":
@@ -542,10 +575,36 @@ class ChatScreen(QWidget):
         self.message_input.installEventFilter(self)
         input_layout.addWidget(self.message_input, stretch=1)
 
+        # Stop speaking button (hidden by default)
+        self.stop_tts_btn = QPushButton("\u23f9")
+        self.stop_tts_btn.setObjectName("stopTtsButton")
+        self.stop_tts_btn.setFixedSize(64, 48)
+        self.stop_tts_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.stop_tts_btn.setToolTip("Stop voice output")
+        self.stop_tts_btn.hide()  # Initially hidden
+        self.stop_tts_btn.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #FEE2E2;
+                color: #EF4444;
+                border-radius: 24px;
+                font-size: 14px;
+                font-weight: bold;
+                border: 1px solid #EF4444;
+            }
+            QPushButton:hover {
+                background-color: #EF4444;
+                color: #FFFFFF;
+            }
+        """
+        )
+        self.stop_tts_btn.clicked.connect(self._stop_tts_playback)
+        input_layout.addWidget(self.stop_tts_btn)
+
         # Dictation button ✍️  – speech-to-text into input box
         self.dictation_btn = QPushButton("\u270D")
         self.dictation_btn.setObjectName("dictationButton")
-        self.dictation_btn.setFixedSize(48, 48)
+        self.dictation_btn.setFixedSize(64, 48)
         self.dictation_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.dictation_btn.setToolTip("Dictation – speech to text into input box")
         self.dictation_btn.setCheckable(True)
@@ -557,7 +616,7 @@ class ChatScreen(QWidget):
         # Microphone button 🎤 – voice conversation (auto-send + TTS)
         self.mic_btn = QPushButton("\U0001F3A4")
         self.mic_btn.setObjectName("micButton")
-        self.mic_btn.setFixedSize(48, 48)
+        self.mic_btn.setFixedSize(64, 48)
         self.mic_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.mic_btn.setToolTip("Voice conversation – auto-send + spoken reply")
         self.mic_btn.setCheckable(True)
@@ -921,10 +980,27 @@ class ChatScreen(QWidget):
     def _add_message_widget(self, message: dict):
         """Add a message widget to the display."""
         widget = MessageWidget(message)
+        widget.read_aloud_requested.connect(self._read_message_aloud)
         self.messages_layout.addWidget(widget)
 
         # Scroll to bottom after layout update
         QTimer.singleShot(50, self._scroll_to_bottom)
+
+    def _read_message_aloud(self, content: str):
+        """Read a specific message aloud."""
+        if not self.voice_service.tts_available:
+            QMessageBox.warning(
+                self, "TTS Unavailable", "Text-to-Speech is not available."
+            )
+            return
+
+        def _tts_done():
+            self._tts_finished_signal.emit()
+
+        # Stop any ongoing speech
+        self.voice_service.stop_speaking()
+        self._update_stop_tts_button(True)
+        self.voice_service.speak(content, callback=_tts_done)
 
     def _scroll_to_bottom(self):
         """Scroll messages to bottom."""
@@ -1215,11 +1291,28 @@ class ChatScreen(QWidget):
         self.message_input.setPlainText(text)
         self._send_message()
 
+    def _stop_tts_playback(self):
+        """Stop current TTS playback manually."""
+        self.voice_service.stop_speaking()
+        self._update_stop_tts_button(False)
+
+    def _update_stop_tts_button(self, visible: bool):
+        """Update visibility of TTS stop button."""
+        if visible:
+            self.dictation_btn.hide()
+            self.mic_btn.hide()
+            self.stop_tts_btn.show()
+        else:
+            self.stop_tts_btn.hide()
+            self.dictation_btn.show()
+            self.mic_btn.show()
+
     def _on_tts_finished(self):
         """
         Called when TTS playback finishes.
         Resumes listening if voice mode is still enabled.
         """
+        self._update_stop_tts_button(False)
         if self._voice_mode and self.current_chat:
             def _on_transcript(text: str):
                 self._transcript_signal.emit(text)
@@ -1335,6 +1428,7 @@ class ChatScreen(QWidget):
         if self._voice_mode and self.voice_service.tts_available:
             def _tts_done():
                 self._tts_finished_signal.emit()
+            self._update_stop_tts_button(True)
             self.voice_service.speak(response["response"], callback=_tts_done)
         elif self._voice_mode:
             # TTS not available – resume listening immediately
