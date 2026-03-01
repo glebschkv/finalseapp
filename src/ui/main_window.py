@@ -164,5 +164,9 @@ class MainWindow(QMainWindow):
             from ..services.auth_service import AuthService
             AuthService.logout(self.session_token)
 
+        # Explicitly stop any playing audio when closing the app
+        if self.chat_screen and hasattr(self.chat_screen, 'voice_service'):
+            self.chat_screen.voice_service.stop_speaking()
+
         logger.info("Application closing")
         event.accept()

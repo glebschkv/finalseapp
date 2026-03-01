@@ -27,9 +27,8 @@ python-dotenv>=1.0.0
 # pyaudio>=0.2.13
 sounddevice>=0.4.6
 
-# Speech-to-Text (faster-whisper – local Whisper inference, GPU-accelerated)
+# Speech-to-Text (faster-whisper – local Whisper inference)
 faster-whisper>=1.0.0
-nvidia-cublas-cu12>=12.0.0     # CUDA cuBLAS runtime for GPU inference
 
 # Text-to-Speech (edge-tts – Microsoft Edge neural voices)
 edge-tts>=7.0.0

@@ -15,20 +15,7 @@ import asyncio
 import tempfile
 import os
 import sys
-
-# ── CUDA DLL search path fix (Windows) ───────────────────────
-# nvidia-cublas-cu12 installs DLLs under site-packages/nvidia/*/bin/
-# which is not on the default DLL search path.  Register these
-# directories so CTranslate2 can find cublas64_12.dll at runtime.
-if sys.platform == "win32":
-    import site as _site
-    for _sp in _site.getsitepackages():
-        _nvidia_dir = os.path.join(_sp, "nvidia")
-        if os.path.isdir(_nvidia_dir):
-            for _pkg in os.listdir(_nvidia_dir):
-                _bin = os.path.join(_nvidia_dir, _pkg, "bin")
-                if os.path.isdir(_bin):
-                    os.add_dll_directory(_bin)
+import atexit
 
 from ..config.settings import get_settings
 from ..config.logging_config import get_logger
@@ -88,8 +75,8 @@ class VoiceService:
 
     # Whisper settings
     WHISPER_MODEL_SIZE = "base"       # tiny | base | small | medium | large-v3
-    WHISPER_DEVICE = "cuda"           # "cpu" or "cuda"
-    WHISPER_COMPUTE = "float16"       # float16 for GPU, auto/float32 for CPU
+    WHISPER_DEVICE = "cpu"  # "cpu" or "cuda"
+    WHISPER_COMPUTE = "float32"  # float16 for GPU, auto/float32 for CPU
 
     # Edge-TTS settings
     TTS_VOICE = "en-US-AriaNeural"    # Microsoft neural voice
@@ -112,6 +99,9 @@ class VoiceService:
 
         self._listen_thread: Optional[threading.Thread] = None
         self._audio_queue: queue.Queue = queue.Queue()
+
+        self._current_play_process: Optional['subprocess.Popen'] = None
+        atexit.register(self.stop_speaking)
 
         self._initialize_services()
 
@@ -137,10 +127,8 @@ class VoiceService:
             logger.info("faster-whisper not installed – skipping model preload")
             return
 
-        # Try configured device/compute first, then fall back to CPU float32
+        # Try configured device/compute first
         attempts = [(cls.WHISPER_DEVICE, cls.WHISPER_COMPUTE)]
-        if cls.WHISPER_DEVICE == "cuda":
-            attempts.append(("cpu", "float32"))
 
         for device, compute in attempts:
             try:
@@ -176,9 +164,6 @@ class VoiceService:
         compute_types = [self.WHISPER_COMPUTE]
         if self.WHISPER_DEVICE == "cpu" and "float32" not in compute_types:
             compute_types.append("float32")  # safe fallback
-        elif self.WHISPER_DEVICE == "cuda":
-            # If CUDA fails, fall back to CPU with float32
-            compute_types.append("float32")
 
         last_error = None
         device = self.WHISPER_DEVICE
@@ -195,9 +180,6 @@ class VoiceService:
             except Exception as e:
                 logger.warning(f"Whisper device='{device}' compute_type='{ct}' failed: {e}")
                 last_error = e
-                # If CUDA failed, try falling back to CPU
-                if device == "cuda":
-                    device = "cpu"
 
         raise RuntimeError(f"Failed to load speech recognition model: {last_error}")
 
@@ -465,15 +447,31 @@ class VoiceService:
             if self._stop_speaking:
                 return
 
-            # Read the mp3 and decode to raw audio for sounddevice
-            import soundfile as sf
-            audio_data, sample_rate = sf.read(tmp_path, dtype="float32")
+            # ── Platform-aware playback ───────────────────────
+            if sys.platform == "darwin":
+                # macOS: use built-in afplay (supports MP3 natively)
+                # avoids soundfile/libsndfile MP3 decoding issues
+                import subprocess
+                proc = subprocess.Popen(["afplay", tmp_path])
+                self._current_play_process = proc
+                while proc.poll() is None:
+                    if self._stop_speaking:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                        self._current_play_process = None
+                        return
+                    time.sleep(0.1)
+                self._current_play_process = None
+            else:
+                # Windows / Linux: decode with soundfile and play via sounddevice
+                import soundfile as sf
+                audio_data, sample_rate = sf.read(tmp_path, dtype="float32")
 
-            if self._stop_speaking:
-                return
+                if self._stop_speaking:
+                    return
 
-            sd.play(audio_data, samplerate=sample_rate)
-            sd.wait()
+                sd.play(audio_data, samplerate=sample_rate)
+                sd.wait()
 
             logger.info(f"TTS completed for: {text[:60]}…")
 
@@ -494,10 +492,103 @@ class VoiceService:
     def stop_speaking(self):
         """Interrupt TTS playback."""
         self._stop_speaking = True
+        
+        if getattr(self, "_current_play_process", None) is not None:
+            try:
+                self._current_play_process.terminate()
+                self._current_play_process.wait(timeout=1)
+            except Exception:
+                pass
+            self._current_play_process = None
+
         try:
-            sd.stop()
+            if 'sd' in globals():
+                sd.stop()
         except Exception:
             pass
+
+    # ──────────────────────────────────────────────────────────
+    # TTS Health Check
+    # ──────────────────────────────────────────────────────────
+
+    def check_tts(self) -> Tuple[bool, str]:
+        """
+        Run a quick diagnostic to verify the TTS pipeline works end-to-end.
+
+        Checks performed:
+        1. edge-tts library is importable
+        2. Audio output device is available
+        3. edge-tts can synthesise a short test phrase to an MP3 file
+        4. The MP3 file is non-empty and can be decoded for playback
+           (or played via afplay on macOS)
+
+        Returns:
+            (ok, message) – *ok* is True if TTS is fully operational.
+        """
+        # 1. Library availability
+        if not HAS_EDGE_TTS:
+            return False, "edge-tts is not installed. Install it with: pip install edge-tts"
+
+        if not HAS_AUDIO:
+            return False, "sounddevice/numpy not installed. Audio playback unavailable."
+
+        # 2. Output device
+        try:
+            devices = sd.query_devices()
+            output_devices = [d for d in devices if d["max_output_channels"] > 0]
+            if not output_devices:
+                return False, "No audio output device found. Please connect speakers or headphones."
+        except Exception as e:
+            return False, f"Could not query audio devices: {e}"
+
+        # 3. Synthesise a short test phrase
+        tmp_path = None
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+            os.close(tmp_fd)
+
+            communicate = edge_tts.Communicate(
+                "TTS check",
+                voice=self.TTS_VOICE,
+                rate=self.TTS_RATE,
+                volume=self.TTS_VOLUME,
+            )
+            loop.run_until_complete(communicate.save(tmp_path))
+            loop.close()
+
+            file_size = os.path.getsize(tmp_path)
+            if file_size == 0:
+                return False, "edge-tts produced an empty audio file. Check your internet connection."
+
+        except Exception as e:
+            return False, f"edge-tts synthesis failed: {e}"
+
+        # 4. Verify the audio file can be decoded / played
+        try:
+            if sys.platform == "darwin":
+                # macOS: just confirm afplay exists
+                import shutil
+                if not shutil.which("afplay"):
+                    return False, "macOS afplay command not found – cannot play audio."
+            else:
+                import soundfile as sf
+                audio_data, sample_rate = sf.read(tmp_path, dtype="float32")
+                if len(audio_data) == 0:
+                    return False, "Decoded audio is empty – soundfile may lack MP3 codec support."
+        except Exception as e:
+            return False, f"Audio decoding failed: {e}"
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+        logger.info("TTS health check passed")
+        return True, "TTS is working properly."
 
     # ──────────────────────────────────────────────────────────
     # Legacy convenience aliases
