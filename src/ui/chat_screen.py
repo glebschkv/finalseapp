@@ -1302,10 +1302,13 @@ class ChatScreen(QWidget):
             self.dictation_btn.hide()
             self.mic_btn.hide()
             self.stop_tts_btn.show()
+            self.message_input.setPlaceholderText("\U0001f5e3 Bot is speaking…")
         else:
             self.stop_tts_btn.hide()
             self.dictation_btn.show()
             self.mic_btn.show()
+            if not getattr(self, "_voice_mode", False):
+                self.message_input.setPlaceholderText("Ask about your vehicle...")
 
     def _on_tts_finished(self):
         """
@@ -1326,6 +1329,12 @@ class ChatScreen(QWidget):
                 self.mic_btn.setChecked(True)
                 self.mic_btn.setStyleSheet(self._mic_btn_style(True))
                 self.message_input.setPlaceholderText("\U0001F3A4 Listening – speak now…")
+            else:
+                self._voice_active = False
+                self._voice_mode = False
+                self.mic_btn.setChecked(False)
+                self.mic_btn.setStyleSheet(self._mic_btn_style(False))
+                self.message_input.setPlaceholderText("Ask about your vehicle...")
 
     def _cleanup_worker(self):
         """Cancel and clean up the active worker thread."""
