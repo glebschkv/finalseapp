@@ -16,20 +16,6 @@ import tempfile
 import os
 import sys
 
-# ── CUDA DLL search path fix (Windows) ───────────────────────
-# nvidia-cublas-cu12 installs DLLs under site-packages/nvidia/*/bin/
-# which is not on the default DLL search path.  Register these
-# directories so CTranslate2 can find cublas64_12.dll at runtime.
-if sys.platform == "win32":
-    import site as _site
-    for _sp in _site.getsitepackages():
-        _nvidia_dir = os.path.join(_sp, "nvidia")
-        if os.path.isdir(_nvidia_dir):
-            for _pkg in os.listdir(_nvidia_dir):
-                _bin = os.path.join(_nvidia_dir, _pkg, "bin")
-                if os.path.isdir(_bin):
-                    os.add_dll_directory(_bin)
-
 from ..config.settings import get_settings
 from ..config.logging_config import get_logger
 
@@ -88,8 +74,8 @@ class VoiceService:
 
     # Whisper settings
     WHISPER_MODEL_SIZE = "base"       # tiny | base | small | medium | large-v3
-    WHISPER_DEVICE = "cuda"           # "cpu" or "cuda"
-    WHISPER_COMPUTE = "float16"       # float16 for GPU, auto/float32 for CPU
+    WHISPER_DEVICE = "cpu"  # "cpu" or "cuda"
+    WHISPER_COMPUTE = "float32"  # float16 for GPU, auto/float32 for CPU
 
     # Edge-TTS settings
     TTS_VOICE = "en-US-AriaNeural"    # Microsoft neural voice
@@ -137,10 +123,8 @@ class VoiceService:
             logger.info("faster-whisper not installed – skipping model preload")
             return
 
-        # Try configured device/compute first, then fall back to CPU float32
+        # Try configured device/compute first
         attempts = [(cls.WHISPER_DEVICE, cls.WHISPER_COMPUTE)]
-        if cls.WHISPER_DEVICE == "cuda":
-            attempts.append(("cpu", "float32"))
 
         for device, compute in attempts:
             try:
@@ -176,9 +160,6 @@ class VoiceService:
         compute_types = [self.WHISPER_COMPUTE]
         if self.WHISPER_DEVICE == "cpu" and "float32" not in compute_types:
             compute_types.append("float32")  # safe fallback
-        elif self.WHISPER_DEVICE == "cuda":
-            # If CUDA fails, fall back to CPU with float32
-            compute_types.append("float32")
 
         last_error = None
         device = self.WHISPER_DEVICE
@@ -195,9 +176,6 @@ class VoiceService:
             except Exception as e:
                 logger.warning(f"Whisper device='{device}' compute_type='{ct}' failed: {e}")
                 last_error = e
-                # If CUDA failed, try falling back to CPU
-                if device == "cuda":
-                    device = "cpu"
 
         raise RuntimeError(f"Failed to load speech recognition model: {last_error}")
 
