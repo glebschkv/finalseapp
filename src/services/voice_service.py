@@ -465,15 +465,28 @@ class VoiceService:
             if self._stop_speaking:
                 return
 
-            # Read the mp3 and decode to raw audio for sounddevice
-            import soundfile as sf
-            audio_data, sample_rate = sf.read(tmp_path, dtype="float32")
+            # ── Platform-aware playback ───────────────────────
+            if sys.platform == "darwin":
+                # macOS: use built-in afplay (supports MP3 natively)
+                # avoids soundfile/libsndfile MP3 decoding issues
+                import subprocess
+                proc = subprocess.Popen(["afplay", tmp_path])
+                while proc.poll() is None:
+                    if self._stop_speaking:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                        return
+                    time.sleep(0.1)
+            else:
+                # Windows / Linux: decode with soundfile and play via sounddevice
+                import soundfile as sf
+                audio_data, sample_rate = sf.read(tmp_path, dtype="float32")
 
-            if self._stop_speaking:
-                return
+                if self._stop_speaking:
+                    return
 
-            sd.play(audio_data, samplerate=sample_rate)
-            sd.wait()
+                sd.play(audio_data, samplerate=sample_rate)
+                sd.wait()
 
             logger.info(f"TTS completed for: {text[:60]}…")
 
