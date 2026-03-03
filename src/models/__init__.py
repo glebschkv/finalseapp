@@ -3,6 +3,7 @@
 from .base import Base, get_engine, get_session, init_database
 from .user import User
 from .chat import Chat, Message
+from .session import PersistentSession
 
 __all__ = [
     "Base",
@@ -11,5 +12,6 @@ __all__ = [
     "init_database",
     "User",
     "Chat",
-    "Message"
+    "Message",
+    "PersistentSession"
 ]

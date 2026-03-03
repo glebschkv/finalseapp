@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 
 from ..models.base import get_session, DatabaseSession
 from ..models.user import User
+from ..models.session import PersistentSession
 from ..config.logging_config import get_logger
 from ..utils.validators import RateLimiter, InputSanitizer
 
@@ -189,6 +190,19 @@ class AuthService:
         if session_token in cls._sessions:
             user_id = cls._sessions[session_token][0]
             del cls._sessions[session_token]
+
+            # Deactivate the persistent session
+            try:
+                with DatabaseSession() as db_session:
+                    persistent = db_session.query(PersistentSession).filter(
+                        PersistentSession.session_token == session_token,
+                        PersistentSession.is_active == True
+                    ).first()
+                    if persistent:
+                        persistent.deactivate()
+            except Exception as e:
+                logger.warning(f"Failed to deactivate persistent session: {e}")
+
             logger.info(f"User logged out (ID: {user_id})")
             return True
 
@@ -325,7 +339,107 @@ class AuthService:
         # Generate secure token
         token = secrets.token_urlsafe(32)
         cls._sessions[token] = (user_id, datetime.utcnow())
+
+        # Generate a session ID for teleport recovery and persist to database
+        session_id = secrets.token_urlsafe(24)
+        cls._persist_session(session_id, token, user_id)
+
         return token
+
+    @classmethod
+    def _persist_session(cls, session_id: str, token: str, user_id: int) -> None:
+        """Persist a session to the database for teleport recovery."""
+        try:
+            with DatabaseSession() as db_session:
+                # Deactivate any existing persistent sessions for this user
+                existing = db_session.query(PersistentSession).filter(
+                    PersistentSession.user_id == user_id,
+                    PersistentSession.is_active == True
+                ).all()
+                for s in existing:
+                    s.deactivate()
+
+                # Create new persistent session
+                persistent = PersistentSession(
+                    session_id=session_id,
+                    session_token=token,
+                    user_id=user_id,
+                    expires_at=datetime.utcnow() + timedelta(hours=cls.SESSION_EXPIRY_HOURS),
+                )
+                db_session.add(persistent)
+            logger.info(f"Persisted session for user ID: {user_id} (session_id: {session_id})")
+        except Exception as e:
+            logger.warning(f"Failed to persist session: {e}")
+
+    @classmethod
+    def recover_session(cls, session_id: str) -> Optional[Tuple["User", str]]:
+        """
+        Recover a session by its persistent session ID (teleport recovery).
+
+        Args:
+            session_id: The session identifier provided via --teleport
+
+        Returns:
+            Tuple of (User, session_token) if recovery succeeds, None otherwise
+        """
+        try:
+            with DatabaseSession() as db_session:
+                persistent = db_session.query(PersistentSession).filter(
+                    PersistentSession.session_id == session_id,
+                    PersistentSession.is_active == True
+                ).first()
+
+                if not persistent:
+                    logger.warning(f"No active persistent session found for ID: {session_id}")
+                    return None
+
+                if persistent.is_expired:
+                    persistent.deactivate()
+                    logger.warning(f"Persistent session expired for ID: {session_id}")
+                    return None
+
+                # Get the user
+                user = db_session.query(User).filter(User.id == persistent.user_id).first()
+                if not user or not user.is_active:
+                    persistent.deactivate()
+                    logger.warning(f"User not found or inactive for session ID: {session_id}")
+                    return None
+
+                # Restore the in-memory session
+                token = persistent.session_token
+                cls._sessions[token] = (user.id, persistent.created_at)
+
+                logger.info(f"Session recovered for user: {user.username} (session_id: {session_id})")
+
+                db_session.expunge(user)
+                return user, token
+
+        except Exception as e:
+            logger.error(f"Session recovery failed: {e}")
+            return None
+
+    @classmethod
+    def get_session_id_for_token(cls, session_token: str) -> Optional[str]:
+        """
+        Get the persistent session ID for a given session token.
+
+        Args:
+            session_token: The active session token
+
+        Returns:
+            The session ID string, or None if not found
+        """
+        try:
+            with DatabaseSession() as db_session:
+                persistent = db_session.query(PersistentSession).filter(
+                    PersistentSession.session_token == session_token,
+                    PersistentSession.is_active == True
+                ).first()
+                if persistent:
+                    return persistent.session_id
+        except Exception as e:
+            logger.warning(f"Failed to get session ID: {e}")
+        return None
 
     @classmethod
     def _remove_user_sessions(cls, user_id: int) -> None:

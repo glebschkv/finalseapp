@@ -108,7 +108,7 @@ def non_csv_file(tmp_path):
 
 
 def _reset_auth_state():
-    """Reset AuthService state including rate limiters."""
+    """Reset AuthService state including rate limiters and persistent sessions."""
     from src.services.auth_service import AuthService
     AuthService._sessions.clear()
     AuthService._login_limiter._attempts.clear()

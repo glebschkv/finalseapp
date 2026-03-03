@@ -12,6 +12,7 @@ from .login_screen import LoginScreen
 from .chat_screen import ChatScreen
 from ..models.base import init_database
 from ..models.user import User
+from ..services.auth_service import AuthService
 from ..services.granite_client import GraniteClient
 from ..config.logging_config import get_logger
 
@@ -98,6 +99,35 @@ class MainWindow(QMainWindow):
             self._ai_status_label.setText("AI: Unknown")
             self._ai_status_label.setStyleSheet("color: #94A3B8; padding: 0 8px;")
 
+    def teleport_recover(self, session_id: str) -> bool:
+        """
+        Attempt to recover a session via teleport.
+
+        Skips the login screen and goes directly to chat if the session
+        is valid.
+
+        Args:
+            session_id: The persistent session ID to recover
+
+        Returns:
+            True if recovery succeeded, False otherwise
+        """
+        result = AuthService.recover_session(session_id)
+        if result is None:
+            logger.warning(f"Teleport recovery failed for session: {session_id}")
+            QMessageBox.warning(
+                self,
+                "Session Recovery Failed",
+                "Could not recover the session. The session may have expired "
+                "or been invalidated.\nPlease log in again."
+            )
+            return False
+
+        user, token = result
+        logger.info(f"Teleport recovery successful for user: {user.username}")
+        self._on_login_success(user, token)
+        return True
+
     def _on_login_success(self, user: User, token: str):
         """Handle successful login."""
         logger.info(f"User logged in: {user.username}")
@@ -161,7 +191,6 @@ class MainWindow(QMainWindow):
 
         # Logout if user is logged in
         if self.session_token:
-            from ..services.auth_service import AuthService
             AuthService.logout(self.session_token)
 
         # Explicitly stop any playing audio when closing the app

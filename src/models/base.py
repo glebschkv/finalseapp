@@ -53,7 +53,7 @@ def get_session() -> Session:
 def init_database() -> None:
     """Initialize the database, creating all tables."""
     # Import all models to ensure they're registered with Base
-    from . import user, chat  # noqa: F401
+    from . import user, chat, session  # noqa: F401
 
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
