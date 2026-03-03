@@ -20,54 +20,46 @@ The remainder of this report covers the technical development of the system (Sec
 
 ## 1.2 – System Access and Setup
 
-The source code is hosted on GitHub at:
-**https://github.com/COMP2281/software-engineering-group25-26-18.git**
+The full source code for OBD InsightBot is available on GitHub at https://github.com/COMP2281/software-engineering-group25-26-18.git. A copy of the code has also been submitted via Ultra alongside this report.
 
-A copy has also been submitted via Ultra alongside this report.
+Before installing, make sure the following are available on your machine:
 
-**Prerequisites:**
 - Python 3.8 or higher
-- Ollama (https://ollama.com)
-- Approximately 2 GB of free disk space for the Granite model
-- A microphone (optional, only required for voice features)
+- Ollama, which can be downloaded from https://ollama.com
+- Around 2 GB of free disk space (needed for the Granite language model)
+- A working microphone, if you want to use the voice features
 
-**Setup steps:**
+To get the application running, follow these five steps. Each command should be entered in a terminal window (Command Prompt or PowerShell on Windows, Terminal on macOS/Linux).
 
-1. Clone the repository:
-```
-git clone https://github.com/COMP2281/software-engineering-group25-26-18.git
-cd software-engineering-group25-26-18
-```
+First, clone the repository and navigate into the project folder:
 
-2. Create and activate a virtual environment:
-```
-python3 -m venv venv
-source venv/bin/activate          # macOS / Linux
-venv\Scripts\activate             # Windows
-```
+    git clone https://github.com/COMP2281/software-engineering-group25-26-18.git
+    cd software-engineering-group25-26-18
 
-3. Install dependencies:
-```
-pip install -r requirements.txt
-```
+Next, create a Python virtual environment and activate it. The activation command differs by platform:
 
-4. Start Ollama and pull the Granite model:
-```
-ollama serve
-ollama pull granite3.3:2b
-```
+    python3 -m venv venv
+    source venv/bin/activate        (macOS / Linux)
+    venv\Scripts\activate           (Windows)
 
-5. Run the application:
-```
-python src/main.py
-```
+Then install the project dependencies:
 
-The application has been tested on Windows 10/11, macOS, and Ubuntu. Voice features require a working audio input device.
+    pip install -r requirements.txt
 
-**Getting started:**
-On launch, register a new account with a username and password, then log in. Click "New Chat" and upload an OBD-II CSV file to begin. We have included three demo log files in the repository root (demo_log.csv, demo_log_2.csv, demo_log_3.csv) for immediate testing. Once uploaded, try asking "What's wrong with my vehicle?" or "Explain fault code P0300".
+After that, start the Ollama service and download the IBM Granite model. This is a one-time download of roughly 1.5 GB:
 
-Staff are free to create as many accounts as needed. Accounts and all associated data can be deleted from within the application.
+    ollama serve
+    ollama pull granite3.3:2b
+
+Finally, launch the application:
+
+    python src/main.py
+
+We have tested this on Windows 10, Windows 11, macOS, and Ubuntu. Voice features will only work if a microphone is connected.
+
+Once the application opens, create an account with a username and password, then log in. From the main screen, click "New Chat" and upload an OBD-II CSV file to start a conversation about your vehicle data. We have included three sample log files in the repository root (demo_log.csv, demo_log_2.csv, and demo_log_3.csv) so you can try it out straight away. Good first questions to ask include "What's wrong with my vehicle?" or "Explain fault code P0300".
+
+You can create as many accounts as you need, and any account along with its associated data can be deleted from within the application at any time.
 
 
 ## 1.3 – Behavioural Requirements Status
