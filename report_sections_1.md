@@ -2,15 +2,15 @@
 
 ## 1.1 – Project Summary
 
-Modern vehicles produce a huge amount of diagnostic data through their OBD-II (On-Board Diagnostics, Version II) systems — everything from engine RPM and coolant temperatures to fault codes and emission readings, all standardised under SAE J1979 and its international equivalent ISO 15031-5 [1]. The problem is, most people have no idea what any of it means. A 2024 Motorpoint study found that 76% of UK motorists wouldn't know what to do if their car broke down [2], and over half rely entirely on a mechanic for any maintenance concern at all. So there's this gap between what the car is telling you and what you can actually do with that information. We started calling it the "diagnostic divide" pretty early on in the project and it became the core motivation behind everything we built.
+Modern vehicles generate a large volume of diagnostic data through their OBD-II (On-Board Diagnostics, Version II) systems, standardised under SAE J1979 and ISO 15031-5 [1]. These systems track metrics such as engine RPM, coolant temperature, throttle position, and diagnostic trouble codes. However, most of this data is inaccessible to the average driver. A 2024 Motorpoint study found that 76% of UK motorists wouldn't know what to do if their car broke down [2], and over half rely entirely on professional assistance for any maintenance concern. There is a clear gap between the diagnostic data a vehicle produces and the owner's ability to interpret it. We refer to this as the "diagnostic divide", and closing it became the central motivation for the project.
 
-IBM approached us to try and solve this problem. Our client contact throughout has been John McNamara, who is a Product Owner at IBM. In our initial meetings with John, we talked a lot about who this application was really for — not mechanics, not car enthusiasts, but everyday drivers who just want to know if something's wrong and what they should do about it. That's where OBD InsightBot came from. It's a desktop chatbot built with Python and PyQt6 that lets you upload an OBD-II log file and have a proper conversation about what's going on with your vehicle, all in plain English.
+IBM commissioned our group to develop a solution. Our primary client contact throughout has been John McNamara, Product Owner at IBM. In early meetings with John, we discussed the target user profile: not mechanics or enthusiasts, but everyday drivers who want to know if something is wrong and what to do about it. From this, we developed OBD InsightBot, a locally-hosted desktop chatbot built with Python and PyQt6. Users upload an OBD-II log file in CSV format and can then ask questions about their vehicle's health in plain English.
 
-Under the hood, the system parses CSV-formatted OBD-II data, pulls out key metrics like engine RPM, coolant temperature, and throttle position, and picks up any diagnostic trouble codes. All of that gets fed into a RAG (Retrieval-Augmented Generation) pipeline that uses IBM's Granite 3.3 model, running locally through Ollama so nothing leaves the user's machine. We also added voice interaction — speech-to-text for dictation and a full voice conversation mode — because John was keen on the idea of hands-free use while driving.
+The system parses the uploaded CSV, extracts key metrics (engine RPM, coolant temperature, throttle position, etc.) and any diagnostic trouble codes, then passes this data into a Retrieval-Augmented Generation (RAG) pipeline powered by IBM's Granite 3.3 language model running locally via Ollama. This means no data leaves the user's machine. We also implemented voice interaction, including speech-to-text dictation and a full voice conversation mode, as John was keen on supporting hands-free use while driving.
 
-Going into the project we set ourselves four concrete goals: parse any valid OBD-II CSV and extract all standard metrics; explain every generic diagnostic trouble code from a database of 185+ codes; classify each response using our traffic light system (critical, warning, normal) so users immediately know how serious something is; and support both text and voice interaction. We're happy to say all four have been met in the final build.
+We set four measurable goals at the start of the project: (1) parse any valid OBD-II CSV and extract all standard metrics, (2) explain every generic diagnostic trouble code from a database of 185+ codes, (3) classify each AI response by severity using a traffic light system (critical, warning, normal), and (4) support both text and voice-based interaction. All four objectives have been met in the final build.
 
-The rest of this report is structured as follows: Section 2 covers the technical development, Section 3 provides full use and installation instructions, and Section 4 discusses maintenance and the ethical implications of the system.
+The remainder of this report covers the technical development of the system (Section 2), use and installation instructions (Section 3), and maintenance considerations including ethical implications (Section 4).
 
 **References:**
 [1] SAE International, "J1979: E/E Diagnostic Test Modes," SAE Standard, 2017.
@@ -20,16 +20,16 @@ The rest of this report is structured as follows: Section 2 covers the technical
 
 ## 1.2 – System Access and Setup
 
-The full source code is hosted on GitHub at:
+The source code is hosted on GitHub at:
 **https://github.com/COMP2281/software-engineering-group25-26-18.git**
 
 A copy has also been submitted via Ultra alongside this report.
 
-To get the application running, you'll need the following:
+**Prerequisites:**
 - Python 3.8 or higher
 - Ollama (https://ollama.com)
-- Around 2 GB of free disk space for the Granite model download
-- A microphone (only if you want to use the voice features)
+- Approximately 2 GB of free disk space for the Granite model
+- A microphone (optional, only required for voice features)
 
 **Setup steps:**
 
@@ -39,7 +39,7 @@ git clone https://github.com/COMP2281/software-engineering-group25-26-18.git
 cd software-engineering-group25-26-18
 ```
 
-2. Set up a virtual environment:
+2. Create and activate a virtual environment:
 ```
 python3 -m venv venv
 source venv/bin/activate          # macOS / Linux
@@ -62,22 +62,22 @@ ollama pull granite3.3:2b
 python src/main.py
 ```
 
-We've tested this on Windows 10/11, macOS, and Ubuntu and it works across all three. Voice features obviously need a working audio input device.
+The application has been tested on Windows 10/11, macOS, and Ubuntu. Voice features require a working audio input device.
 
 **Getting started:**
-When the application opens you'll see a login screen — just register a new account with a username and password, then log in. To start chatting, hit "New Chat" and upload an OBD-II CSV file. We've included three demo logs in the root of the repo (demo_log.csv, demo_log_2.csv, demo_log_3.csv) so you can get going straight away without needing your own data. Once the file's uploaded, try asking something like "What's wrong with my vehicle?" or "Explain fault code P0300" and the system will respond.
+On launch, register a new account with a username and password, then log in. Click "New Chat" and upload an OBD-II CSV file to begin. We have included three demo log files in the repository root (demo_log.csv, demo_log_2.csv, demo_log_3.csv) for immediate testing. Once uploaded, try asking "What's wrong with my vehicle?" or "Explain fault code P0300".
 
-Feel free to create as many accounts as you need — they can all be deleted from within the app.
+Staff are free to create as many accounts as needed. Accounts and all associated data can be deleted from within the application.
 
 
 ## 1.3 – Behavioural Requirements Status
 
-Below is a summary of where each behavioural requirement stands in the final build. We defined 29 scenarios across 8 features in the Requirements Document. Of those, 27 have been fully met and 2 have not been implemented. Every single MUST-have requirement (BR1 through BR5 — 19 scenarios in total) is fully working. Out of the 10 SHOULD-have scenarios across BR6, BR7, and BR8, we got 8 done. Where we've changed something from the original spec, we've noted what changed and why.
+The table below presents the status of each behavioural requirement from our Requirements Document. We defined 29 scenarios across 8 features. Of those, 27 are fully met and 2 are not implemented. All 19 MUST-have scenarios (BR1 through BR5) are fully working. Of the 10 SHOULD-have scenarios (BR6 through BR8), 8 are fully met and 2 are not. Where a requirement has been modified from the original specification, we have noted the change and our reasoning.
 
 See the table on the following page.
 
 *[Table is provided in the accompanying .docx file due to Word formatting requirements]*
 
-The two scenarios we didn't implement (BR6.2 and BR7.3) were both SHOULD-haves that we made a conscious decision to deprioritise. BR6.2 — inserting dictated text at the cursor position — was a nice-to-have refinement but we focused our time on getting the core voice pipeline working properly instead. BR7.3 — wake word activation — would've needed an always-on microphone listener running in the background, which goes against the privacy-first approach we took with the rest of the system. We felt it was better to stick with a simple button press to start voice mode.
+The two unimplemented scenarios are both SHOULD-haves. BR6.2 (inserting dictated text at the cursor position rather than appending) was deprioritised in favour of getting the core voice pipeline working reliably. BR7.3 (wake word activation) was not implemented because it would require an always-on microphone listener, which conflicts with our local-first, privacy-focused design and would increase background resource consumption.
 
-Worth noting that the changes we did make were all intentional improvements, not cuts. Switching from IBM Granite STT to faster-whisper for speech recognition (BR6.1) was because we wanted everything to run locally without needing an internet connection. Adjusting the silence threshold from 3 seconds down to 2 (BR6.3, BR7.2) came out of our own testing — 3 seconds felt too slow and users kept thinking the system had frozen. And expanding chat export to support JSON and Markdown on top of plain text (BR3.4) was just something we thought would be useful, especially for developers who might want to look at the data programmatically.
+All other modifications were intentional improvements. We switched from IBM Granite STT to faster-whisper for speech recognition (BR6.1) to keep everything running locally without an internet dependency. The silence detection threshold was reduced from 3 seconds to 2 (BR6.3, BR7.2) after user testing showed 3 seconds felt unresponsive. Chat export (BR3.4) was expanded to support JSON and Markdown alongside plain text, which we felt would be useful for developers wanting to work with the data programmatically.
