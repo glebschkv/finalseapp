@@ -64,12 +64,12 @@ You can create as many accounts as you need, and any account along with its asso
 
 ## 1.3 – Behavioural Requirements Status
 
-The table below presents the status of each behavioural requirement from our Requirements Document. We defined 29 scenarios across 8 features. Of those, 27 are fully met and 2 are not implemented. All 19 MUST-have scenarios (BR1 through BR5) are fully working. Of the 10 SHOULD-have scenarios (BR6 through BR8), 8 are fully met and 2 are not. Where a requirement has been modified from the original specification, we have noted the change and our reasoning.
+The table below presents the status of each behavioural requirement from our Requirements Document. We defined 29 scenarios across 8 features. Of those, 27 are fully met and 2 are not implemented. Where a requirement has been modified from the original specification, we have noted the change and our reasoning.
 
 See the table on the following page.
 
 *[Table is provided in the accompanying .docx file due to Word formatting requirements]*
 
-The two unimplemented scenarios are both SHOULD-haves. BR6.2 (inserting dictated text at the cursor position rather than appending) was deprioritised in favour of getting the core voice pipeline working reliably. BR7.3 (wake word activation) was not implemented because it would require an always-on microphone listener, which conflicts with our local-first, privacy-focused design and would increase background resource consumption.
+The two unimplemented scenarios are BR6.2 (inserting dictated text at the cursor position rather than appending), which was deferred in favour of getting the core voice pipeline working reliably, and BR7.3 (wake word activation), which was not implemented because it would require an always-on microphone listener, which conflicts with our local-first, privacy-focused design and would increase background resource consumption.
 
 All other modifications were intentional improvements. We switched from IBM Granite STT to faster-whisper for speech recognition (BR6.1) to keep everything running locally without an internet dependency. The silence detection threshold was reduced from 3 seconds to 2 (BR6.3, BR7.2) after user testing showed 3 seconds felt unresponsive. Chat export (BR3.4) was expanded to support JSON and Markdown alongside plain text, which we felt would be useful for developers wanting to work with the data programmatically.
